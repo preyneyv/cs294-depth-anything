@@ -1,0 +1,5 @@
+.venv
+Depth-Anything-V2
+*.pyc
+__pycache__/
+*.mcap
