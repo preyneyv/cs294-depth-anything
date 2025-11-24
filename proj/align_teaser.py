@@ -33,9 +33,7 @@ def compute_teaser_transform(src_corr: np.ndarray, dst_corr: np.ndarray, noise_b
     Returns: scale (float), R (3x3), t (3,)
     """
     solver = get_teaser_solver(noise_bound=noise_bound, estimate_scaling=True)
-    print("Get the solver...")
     solver.solve(src_corr, dst_corr)
-    print("Get the solution...")
     solution = solver.getSolution()
     s = solution.scale
     R = solution.rotation
@@ -116,7 +114,7 @@ def sim3_teaser_pipeline(pcd_cam, pcd_lidar, noise_bound, corr_src_pts, corr_dst
     init_T[:3, :3] = s * R
     init_T[:3, 3] = t
 
-    # ICP refine: Use ICP to refine the teaser++'s s, R, T. Recommended by GPT
+    # ICP refine
     final_T, icp_res = multi_scale_icp(cam_trans, pcd_lidar, init_T)
 
     fitness, rmse = evaluate(pcd_cam, pcd_lidar, final_T, max_dist=noise_bound * 1.5)
@@ -135,3 +133,24 @@ def sim3_teaser_pipeline(pcd_cam, pcd_lidar, noise_bound, corr_src_pts, corr_dst
         "rmse": rmse,
     }
     return cam_aligned, metadata
+
+if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--cam", required=True, help="Camera point cloud (PLY/PCD)")
+    parser.add_argument("--lidar", required=True, help="LiDAR point cloud (PLY/PCD)")
+    parser.add_argument("--corr_cam", required=True, help="Corresponding camera points (numpy npy or txt)")
+    parser.add_argument("--corr_lidar", required=True, help="Corresponding lidar points")
+    parser.add_argument("--noise", type=float, default=0.05, help="Noise bound for TEASER")
+    args = parser.parse_args()
+
+    pcd_cam = o3d.io.read_point_cloud(args.cam)
+    pcd_lidar = o3d.io.read_point_cloud(args.lidar)
+    # load correspondences
+    corr_cam = np.load(args.corr_cam)  # shape (N,3)
+    corr_lidar = np.load(args.corr_lidar)
+
+    cam_aligned, meta = sim3_teaser_pipeline(pcd_cam, pcd_lidar, args.noise, corr_cam, corr_lidar, verbose=True)
+    print("TEASER final scale:", meta["s"])
+    o3d.io.write_point_cloud("cam_aligned_teaser.ply", cam_aligned)
+    print("Saved aligned cloud to cam_aligned_teaser.ply")
