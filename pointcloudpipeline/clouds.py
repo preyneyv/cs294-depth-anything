@@ -304,7 +304,7 @@ def interpolate_luminar_frames(arr0, arr1, t=0.5, azimuth_bins=36000):
 
     # --- Perform linear interpolation ---
     # Convert t to float to ensure proper arithmetic
-    t = float(t)
+    # t = float(t)
 
     t = max(0.0, min(1.0, float(t))) # ensure t is between 0 and 1
     
@@ -533,13 +533,41 @@ def cloud_indices(clouds):
     """
     return np.array([ts for ts, _ in clouds], dtype=np.int64)
 
-def load_camera():
+def load_camera(bag_path: Path,
+    camera_topic: str,
+    out_dir: Path,
+    max_images: int | None = None):
     """
     Loads all camera frames from a ROS bag. Saves each one in a separate image file. Returns 
     a list of timestamps. 
 
-    also writes to a index file.
+    Read images from the rosbag camera topic, save them as PNGs, and
+    return a list of (timestamp_ns, index) pairs.
+
+    Output:
+      - images/image_00000.png, image_00001.png, ...
+      - cam_index: [(ts_ns0, 0), (ts_ns1, 1), ...]
     """
+    cam_index = []
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    with AnyReader([bag_path], default_typestore=typestore) as reader:
+        connections = [c for c in reader.connections if c.topic == camera_topic]
+        count = 0
+        for conn, timestamp, raw_msg in reader.messages(connections=connections):
+            # deserialize image message, convert to numpy (depends on msg type)
+            # img = ...
+            # save as PNG
+            idx = count
+            img_path = out_dir / f"image_{idx:05d}.png"
+            # Image.fromarray(img).save(img_path)
+
+            cam_index.append((int(timestamp), idx))
+            count += 1
+            if max_images is not None and count >= max_images:
+                break
+
+    return cam_index
 
 def find_surrounding_cloud_indices(timestamp, cloud_timestamps):
     """
@@ -552,7 +580,8 @@ def find_surrounding_cloud_indices(timestamp, cloud_timestamps):
         return len(cloud_timestamps) - 1, len(cloud_timestamps) - 1
     return i - 1, i
 
-def calculate_camera_to_lidar_transform():
+
+def calculate_camera_to_lidar_transform(camera_timestamps, cloud_timestamps):
     """
     Inputs: 
     - list of timestamps from the camera
@@ -560,15 +589,30 @@ def calculate_camera_to_lidar_transform():
     Outputs:
     - for each camera frame, the nearest 2 lidar point clouds
     - scalar value needed to interpolate the camera frame to the nearest 2 lidar point cloud
-    """
 
-def iteratively_call_luminar_interpolation():
+    iteratively call find_surrounding_cloud_indices for each camera frame
     """
-    this could just be main:
+    camera_to_lidar_transform = []
+    for camera_timestamp in camera_timestamps:
+        nearest_cloud_indices = find_surrounding_cloud_indices(camera_timestamp, cloud_timestamps)
+        scalar_value = #TODO:?? how to calculate this?
+        camera_to_lidar_transform.append((camera_timestamp, nearest_cloud_indices, scalar_value))
+    return camera_to_lidar_transform
 
-    """
 
 def main():
+    """
+    Ne wmain function. 
+    Load the camera frames and the lidar point clouds
+    Iteratively call match_timestamps for each camera frame
+    Save all the camera frames in the correct format
+    Save all the interpolated point clouds in the correct format
+    Could Save a simple index file that indicates names, but it should mostly just be:
+    camera/camera_00001.png
+    lidar/pointcloud_00001.pcd
+    """
+    #TODO
+   
     """
     Main function: Extract point clouds from ROS bag and demonstrate interpolation.
 
@@ -600,6 +644,7 @@ def main():
 
     # Interpolate between the two frames at the midpoint (t=0.5)
     # This creates a synthetic point cloud at a time halfway between the two captures
+    # TODO: This should be done in a loop over all camera frames??
     xyz_mid, refl_mid, ts_mid, idx0, idx1 = interpolate_luminar_frames(
         c1, c2,
         t=0.5,           # Interpolate at the midpoint
