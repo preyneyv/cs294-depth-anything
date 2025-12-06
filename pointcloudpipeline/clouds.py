@@ -470,8 +470,20 @@ def load_luminar_clouds(bag_path: Path, topic: str = "/luminar_front/points/exis
     
     clouds: list[tuple[int, np.ndarray]] = []
 
+    # Detect file format by checking the file header
+    # MCAP files start with: 0x89 0x4D 0x43 0x41 0x50 (MCAP in ASCII)
+    # Format: \x89MCAP<version><newline> where version is typically '0' or '1'
+    mcap_magic = b'\x89MCAP'
+    with open(bag_path, 'rb') as f:
+        file_header = f.read(8)  # Read first 8 bytes to see full header
+    is_mcap = file_header[:5] == mcap_magic  # Check first 5 bytes for MCAP magic
+    
+    if is_mcap:
+        print(f"Detected MCAP format (header: {[hex(b) for b in file_header]})")
+    else:
+        print(f"File format detection: header = {[hex(b) for b in file_header[:6]]}")
+
     # AnyReader should auto-detect MCAP vs ROS bag format
-    # For MCAP files, it should recognize the .mcap extension or file header
     try:
         with AnyReader([bag_path], default_typestore=typestore) as reader:
             # Find all connections matching the desired topic
@@ -492,18 +504,25 @@ def load_luminar_clouds(bag_path: Path, topic: str = "/luminar_front/points/exis
                 # Store timestamp and point cloud array
                 clouds.append((int(timestamp), arr))
     
-    except UnicodeDecodeError as e:
-        # This error suggests the file format was misidentified
-        # MCAP files start with byte 0x89, which can be confused with other formats
-        raise ValueError(
-            f"Failed to read bag file '{bag_path}'. "
-            f"The file may be corrupted or in an unsupported format. "
-            f"Expected MCAP or ROS bag format. Error: {e}"
-        ) from e
+    except Exception as e:
+        # Provide helpful error message based on detected file format
+        if is_mcap:
+            raise ValueError(
+                f"Failed to read MCAP file '{bag_path}'. "
+                f"The file is confirmed to be MCAP format (header: {[hex(b) for b in file_header[:5]]}). "
+                f"Ensure rosbags>=0.11.0 and mcap-ros2-support are installed. "
+                f"Error: {e}"
+            ) from e
+        else:
+            raise ValueError(
+                f"Failed to read bag file '{bag_path}'. "
+                f"Expected MCAP or ROS bag format. Error: {e}"
+            ) from e
 
     # Sort by timestamp to ensure chronological order
     clouds.sort(key=lambda x: x[0])
     return clouds
+
 
 def main():
     """
