@@ -441,6 +441,69 @@ def make_xyz(arr):
     # Return only the points that pass both filters
     return xyz[mask]
 
+def load_luminar_clouds(bag_path: Path, topic: str = "/luminar_front/points/existence_prob_filtered"):
+    """
+    Load all Luminar point cloud frames from a ROS2/MCAP bag.
+
+    Args:
+        bag_path: Path to the MCAP or ROS bag file. Can be relative or absolute.
+        topic: ROS topic name to extract point clouds from. Default is the Luminar
+               front sensor topic with existence probability filtering.
+
+    Returns:
+        List of (timestamp_ns: int, points: np.ndarray) tuples, sorted by time.
+
+    Raises:
+        FileNotFoundError: If the bag file doesn't exist.
+        ValueError: If the file format cannot be determined or is unsupported.
+    """
+    # Resolve the path to absolute to avoid relative path issues
+    bag_path = bag_path.resolve()
+    
+    # Verify the file exists
+    if not bag_path.exists():
+        raise FileNotFoundError(f"Bag file not found: {bag_path}")
+    
+    # Verify it's a file (not a directory)
+    if not bag_path.is_file():
+        raise ValueError(f"Path is not a file: {bag_path}")
+    
+    clouds: list[tuple[int, np.ndarray]] = []
+
+    # AnyReader should auto-detect MCAP vs ROS bag format
+    # For MCAP files, it should recognize the .mcap extension or file header
+    try:
+        with AnyReader([bag_path], default_typestore=typestore) as reader:
+            # Find all connections matching the desired topic
+            connections = [c for c in reader.connections if c.topic == topic]
+            
+            if not connections:
+                raise ValueError(f"Topic '{topic}' not found in bag file. "
+                               f"Available topics: {[c.topic for c in reader.connections]}")
+            
+            # Read all messages from this topic
+            for conn, timestamp, raw_msg in reader.messages(connections=connections):
+                # Deserialize the ROS message
+                pc = reader.deserialize(raw_msg, conn.msgtype)
+                
+                # Convert to structured NumPy array
+                arr = luminar_cloud_to_struct(pc)
+                
+                # Store timestamp and point cloud array
+                clouds.append((int(timestamp), arr))
+    
+    except UnicodeDecodeError as e:
+        # This error suggests the file format was misidentified
+        # MCAP files start with byte 0x89, which can be confused with other formats
+        raise ValueError(
+            f"Failed to read bag file '{bag_path}'. "
+            f"The file may be corrupted or in an unsupported format. "
+            f"Expected MCAP or ROS bag format. Error: {e}"
+        ) from e
+
+    # Sort by timestamp to ensure chronological order
+    clouds.sort(key=lambda x: x[0])
+    return clouds
 
 def main():
     """
@@ -459,28 +522,13 @@ def main():
     """
     # Extract all point clouds from rosbag and convert to xyz numpy arrays
     # Open the MCAP/ROS bag file for reading
-    bag_path = Path("dpt_rosbag_lvms_2024_12/rosbag2_2024_12_12-18_21_55_12.mcap")
+    # Using resolve() to convert relative path to absolute based on script location
+    script_dir = Path(__file__).parent
+    bag_path = script_dir / "../dpt_rosbag_lvms_2024_12/rosbag2_2024_12_12-18_21_55_12.mcap"
     
-    with AnyReader([bag_path], default_typestore=typestore) as reader:
-        # Find all connections (topics) matching the Luminar front point cloud topic
-        connections = [c for c in reader.connections 
-                      if c.topic == "/luminar_front/points/existence_prob_filtered"]
-        
-        # Read all messages from this topic into a list
-        # Each message is a tuple: (connection, timestamp, raw_message_data)
-        raw_messages = list(reader.messages(connections=connections))
-        
-        # Process each message: deserialize and convert to structured array
-        clouds = []
-        for conn, timestamp, raw_msg in raw_messages:
-            # Deserialize the ROS message into a PointCloud2 object
-            pc = reader.deserialize(raw_msg, conn.msgtype)
-            
-            # Convert to structured NumPy array
-            arr = luminar_cloud_to_struct(pc)
-            
-            # Store as (timestamp, structured_array) tuple
-            clouds.append((timestamp, arr))
+    print(f"Loading point clouds from: {bag_path.resolve()}")
+    clouds = load_luminar_clouds(bag_path)
+    print(f"Loaded {len(clouds)} point cloud frames")
 
     # Extract two consecutive frames for interpolation demonstration
     # clouds[1] and clouds[2] are the second and third point clouds in the sequence
@@ -498,6 +546,8 @@ def main():
     # Visualize the original two frames and the interpolated result
     # make_xyz() extracts and filters the XYZ coordinates from each structured array
     show_cloud(make_xyz(c1), make_xyz(c2), xyz_mid)
+
+
 
 
 if __name__ == "__main__":
