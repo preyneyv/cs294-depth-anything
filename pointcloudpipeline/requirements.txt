@@ -1,0 +1,6 @@
+pillow
+numpy
+rosbags
+plotly
+nbformat
+scipy
