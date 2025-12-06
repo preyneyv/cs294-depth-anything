@@ -4,12 +4,12 @@ Pointcloud Pipeline
 A pipeline that extracts and processes Luminar LiDAR point clouds from ROS/MCAP bags.
 Based on the clouds.ipynb notebook.
 
-This module provides functionality to:
-- Parse Luminar PointCloud2 messages into structured NumPy arrays
-- Compute ray identifiers for point matching between frames
-- Interpolate point clouds between frames for temporal alignment
-- Visualize point clouds interactively
-- Filter and process point cloud data
+When run, this code will:
+- Load the camera frames and the lidar point clouds
+- For each camera frame, find the nearest 2 lidar point clouds
+- Interpolate the camera frame to the nearest 2 lidar point clouds
+- Save the interpolated point cloud in 2 different formats (at dataset/lidar/lidar_00000.pcd and dataset/lidar_npz/lidar_00000.npz)
+- Save the camera frame in the correct format (at dataset/camera/image_00000.png)
 """
 
 # Standard library imports
@@ -20,8 +20,16 @@ import numpy as np
 from PIL import Image
 import plotly.graph_objects as go
 import plotly.io as pio
+import cv2
 from rosbags.highlevel import AnyReader
 from rosbags.typesys import Stores, get_typestore
+
+# Try to import rosbags.image, fall back to manual implementation if not available
+try:
+    from rosbags.image import message_to_cvimage
+    ROSBAGS_IMAGE_AVAILABLE = True
+except ImportError:
+    ROSBAGS_IMAGE_AVAILABLE = False
 
 # ROS bag type store initialization (used for deserializing ROS messages)
 typestore = get_typestore(Stores.LATEST)
@@ -299,8 +307,8 @@ def interpolate_luminar_frames(arr0, arr1, t=0.5, azimuth_bins=36000):
     refl1 = A1['reflectance'].astype(np.float32)
 
     # Get timestamps for temporal interpolation
-    ts0 = A0['timestamp'].astype(np.uint64)
-    ts1 = A1['timestamp'].astype(np.uint64)
+    timestamps0 = A0['timestamp'].astype(np.uint64)
+    timestamps1 = A1['timestamp'].astype(np.uint64)
 
     # --- Perform linear interpolation ---
     # Convert t to float to ensure proper arithmetic
@@ -322,7 +330,7 @@ def interpolate_luminar_frames(arr0, arr1, t=0.5, azimuth_bins=36000):
     # Interpolate timestamps
     # Convert to float64 for precision, then back to uint64
     # This handles the large timestamp values correctly
-    ts_mid = ((1.0 - t) * ts0.astype(np.float64) + t * ts1.astype(np.float64)).astype(np.uint64)
+    ts_mid = ((1.0 - t) * timestamps0.astype(np.float64) + t * timestamps1.astype(np.float64)).astype(np.uint64)
 
     return xyz_mid, reflectance_mid, ts_mid, idx0, idx1
 
@@ -551,17 +559,86 @@ def load_camera(bag_path: Path,
     cam_index = []
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    def decode_compressed_image(msg) -> np.ndarray:
+        """Decode sensor_msgs/msg/CompressedImage to BGR numpy image."""
+        arr = np.frombuffer(msg.data, dtype=np.uint8)
+        img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+        if img is None:
+            raise RuntimeError("Failed to decode CompressedImage payload.")
+        return img
+    
+    def decode_image_message(msg) -> np.ndarray:
+        """Decode sensor_msgs/msg/Image to BGR numpy image."""
+        # Get image dimensions and encoding
+        height = msg.height
+        width = msg.width
+        encoding = msg.encoding
+        
+        # Convert raw data to numpy array
+        data = np.frombuffer(msg.data, dtype=np.uint8)
+        
+        # Handle different encodings
+        if encoding in ['rgb8', 'rgb8']:
+            # RGB8: reshape and convert to BGR
+            img = data.reshape((height, width, 3))
+            img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+        elif encoding == 'bgr8':
+            # BGR8: just reshape
+            img = data.reshape((height, width, 3))
+        elif encoding == 'mono8':
+            # Grayscale: convert to BGR
+            img = data.reshape((height, width))
+            img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+        elif encoding in ['bayer_rggb8', 'bayer_bggr8', 'bayer_gbrg8', 'bayer_grbg8']:
+            # Bayer pattern: decode using OpenCV
+            img = data.reshape((height, width))
+            if encoding == 'bayer_rggb8':
+                img = cv2.cvtColor(img, cv2.COLOR_BayerRG2BGR)
+            elif encoding == 'bayer_bggr8':
+                img = cv2.cvtColor(img, cv2.COLOR_BayerBG2BGR)
+            elif encoding == 'bayer_gbrg8':
+                img = cv2.cvtColor(img, cv2.COLOR_BayerGB2BGR)
+            elif encoding == 'bayer_grbg8':
+                img = cv2.cvtColor(img, cv2.COLOR_BayerGR2BGR)
+        else:
+            raise ValueError(f"Unsupported image encoding: {encoding}")
+        
+        return img
+
     with AnyReader([bag_path], default_typestore=typestore) as reader:
         connections = [c for c in reader.connections if c.topic == camera_topic]
+        
+        if not connections:
+            raise ValueError(f"Camera topic '{camera_topic}' not found in bag file. "
+                           f"Available topics: {[c.topic for c in reader.connections]}")
+        
+        # Check if it's compressed or regular image
+        conn = connections[0]
+        is_compressed = 'CompressedImage' in conn.msgtype
+        
         count = 0
         for conn, timestamp, raw_msg in reader.messages(connections=connections):
-            # deserialize image message, convert to numpy (depends on msg type)
-            # img = ...
-            # save as PNG
+            # Deserialize the ROS message
+            msg = reader.deserialize(raw_msg, conn.msgtype)
+            
+            # Convert to numpy image (BGR format)
+            if is_compressed:
+                img = decode_compressed_image(msg)
+            else:
+                # Use rosbags.image if available, otherwise use manual implementation
+                if ROSBAGS_IMAGE_AVAILABLE:
+                    img = message_to_cvimage(msg)
+                else:
+                    img = decode_image_message(msg)
+            
+            # Save as PNG
             idx = count
             img_path = out_dir / f"image_{idx:05d}.png"
-            # Image.fromarray(img).save(img_path)
-
+            success = cv2.imwrite(str(img_path), img)
+            
+            if not success:
+                raise RuntimeError(f"Failed to write image: {img_path}")
+            
             cam_index.append((int(timestamp), idx))
             count += 1
             if max_images is not None and count >= max_images:
@@ -591,14 +668,90 @@ def calculate_camera_to_lidar_transform(camera_timestamps, cloud_timestamps):
     - scalar value needed to interpolate the camera frame to the nearest 2 lidar point cloud
 
     iteratively call find_surrounding_cloud_indices for each camera frame
+    Outputs:
+        A list of tuples:
+            (camera_timestamp_ns, image_idx, (cloud_idx0, cloud_idx1), scalar_value)
+
+        where scalar_value in [0, 1] is the interpolation fraction between
+        cloud_idx0 (t=0) and cloud_idx1 (t=1).
     """
-    camera_to_lidar_transform = []
-    for camera_timestamp in camera_timestamps:
-        nearest_cloud_indices = find_surrounding_cloud_indices(camera_timestamp, cloud_timestamps)
-        scalar_value = #TODO:?? how to calculate this?
-        camera_to_lidar_transform.append((camera_timestamp, nearest_cloud_indices, scalar_value))
+    camera_to_lidar_transform: list[tuple[int, int, tuple[int, int], float]] = []
+
+    for camera_timestamp_ns, image_index in camera_timestamps:
+        cloud_index0, cloud_index1 = find_surrounding_cloud_indices(camera_timestamp_ns, cloud_timestamps)
+        timestamp0 = int(cloud_timestamps[cloud_index0])
+        timestamp1 = int(cloud_timestamps[cloud_index1])
+
+        if timestamp1 == timestamp0:
+            # Degenerate case: both timestamps the same; no interpolation needed
+            scalar = 0.0
+        else:
+            scalar = (camera_timestamp_ns - timestamp0) / (timestamp1 - timestamp0)
+            # Clamp scalar into [0, 1] just to be safe
+            scalar = float(max(0.0, min(1.0, scalar)))
+
+        camera_to_lidar_transform.append((camera_timestamp_ns, image_index, (cloud_index0, cloud_index1), scalar))
+
     return camera_to_lidar_transform
 
+def write_pcd_ascii(path: str | Path, xyz: np.ndarray):
+    """
+    Write an (N, 3) float array to an ASCII PCD file.
+
+    xyz must be shape (N,3) and represent x,y,z in meters.
+    """
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    if xyz.ndim != 2 or xyz.shape[1] != 3:
+        raise ValueError(f"xyz must have shape (N,3), got {xyz.shape}")
+
+    N = xyz.shape[0]
+
+    header = (
+        "VERSION .7\n"
+        "FIELDS x y z\n"
+        "SIZE 4 4 4\n"
+        "TYPE F F F\n"
+        "COUNT 1 1 1\n"
+        f"WIDTH {N}\n"
+        "HEIGHT 1\n"
+        "VIEWPOINT 0 0 0 1 0 0 0\n"
+        f"POINTS {N}\n"
+        "DATA ascii\n"
+    )
+
+    # Write file
+    with open(path, "w") as f:
+        f.write(header)
+        # Fast loop: convert rows to strings
+        for x, y, z in xyz:
+            f.write(f"{float(x)} {float(y)} {float(z)}\n")
+
+def write_lidar_npz(path: str | Path,
+                    xyz: np.ndarray,
+                    reflectance: np.ndarray,
+                    timestamp_mid: np.ndarray,
+                    src_idx0: np.ndarray,
+                    src_idx1: np.ndarray) -> None:
+    """
+    Save a richer representation of the interpolated LiDAR frame:
+      - xyz: (N, 3)
+      - reflectance: (N,)
+      - timestamp_mid: (N,)
+      - src_idx0, src_idx1: (N,) indices into the original two frames
+    """
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    np.savez_compressed(
+        path,
+        xyz=xyz,
+        reflectance=reflectance,
+        timestamp_mid=timestamp_mid,
+        src_idx0=src_idx0,
+        src_idx1=src_idx1,
+    )
 
 def main():
     """
@@ -611,49 +764,69 @@ def main():
     camera/camera_00001.png
     lidar/pointcloud_00001.pcd
     """
-    #TODO
-   
-    """
-    Main function: Extract point clouds from ROS bag and demonstrate interpolation.
-
-    This function:
-    1. Opens a ROS/MCAP bag file
-    2. Extracts all Luminar front point cloud messages
-    3. Converts them to structured arrays
-    4. Demonstrates interpolation between two frames
-    5. Visualizes the original and interpolated point clouds
-
-    Note:
-        The bag file path is hardcoded. Modify the Path() argument to point
-        to your specific bag file location.
-    """
-    # Extract all point clouds from rosbag and convert to xyz numpy arrays
-    # Open the MCAP/ROS bag file for reading
-    # Using resolve() to convert relative path to absolute based on script location
-    script_dir = Path(__file__).parent
+    script_dir = Path(__file__).parent.resolve()
     bag_path = script_dir / "../dpt_rosbag_lvms_2024_12/rosbag2_2024_12_12-18_21_55_12.mcap"
-    
-    print(f"Loading point clouds from: {bag_path.resolve()}")
+    # Use absolute path to ensure we save to the correct location
+    out_dir = (script_dir / "../dataset").resolve()
+    camera_topic = "/vimba_front/image"  # Use uncompressed image topic
+    lidar_topic = "/luminar_front/points/existence_prob_filtered"  #TODO: double check this
+
+    camera_timestamps = load_camera(bag_path, camera_topic, out_dir / "camera")
+    if not camera_timestamps:
+        print("No camera frames found; exiting.")
+        return
+
     clouds = load_luminar_clouds(bag_path)
-    print(f"Loaded {len(clouds)} point cloud frames")
+    if not clouds:
+        print("No lidar frames found; exiting.")
+        return
 
-    # Extract two consecutive frames for interpolation demonstration
-    # clouds[1] and clouds[2] are the second and third point clouds in the sequence
-    c1 = clouds[1][1]  # Structured array from frame 1
-    c2 = clouds[2][1]  # Structured array from frame 2
+    cloud_timestamps = cloud_indices(clouds)
 
-    # Interpolate between the two frames at the midpoint (t=0.5)
-    # This creates a synthetic point cloud at a time halfway between the two captures
-    # TODO: This should be done in a loop over all camera frames??
-    xyz_mid, refl_mid, ts_mid, idx0, idx1 = interpolate_luminar_frames(
-        c1, c2,
-        t=0.5,           # Interpolate at the midpoint
-        azimuth_bins=36000,  # Use default azimuth binning resolution
-    )
+    camera_to_lidar_transforms = calculate_camera_to_lidar_transform(camera_timestamps, cloud_timestamps)
+
+    # Print output directory for verification
+    print(f"Saving output to: {out_dir}")
+    print(f"Will save {len(camera_to_lidar_transforms)} point cloud files")
     
-    # Visualize the original two frames and the interpolated result
-    # make_xyz() extracts and filters the XYZ coordinates from each structured array
-    show_cloud(make_xyz(c1), make_xyz(c2), xyz_mid)
+    lidar_pcd_dir = out_dir / "lidar"
+    lidar_npz_dir = out_dir / "lidar_npz"
+
+    # 4) For each camera frame, interpolate and save LiDAR
+    for camera_timestamp_ns, image_index, (cloud_index0, cloud_index1), scalar_value in camera_to_lidar_transforms:
+        timestamp0, cloud0 = clouds[cloud_index0]
+        timestamp1, cloud1 = clouds[cloud_index1]
+
+        # Interpolate between cloud0 and cloud1
+        xyz_mid, refl_mid, ts_mid, idx0, idx1 = interpolate_luminar_frames(
+            cloud0,
+            cloud1,
+            t=scalar_value,
+            azimuth_bins=36000, #default
+        )
+
+        # If you want to be strict, you can skip empty results
+        if xyz_mid.shape[0] == 0:
+            print(f"[WARN] No matched points for camera idx {image_index} (ts={camera_timestamp_ns}); skipping.")
+            continue
+
+        # 5a) Save ASCII PCD (xyz only), file name aligned with image index
+        pcd_path = lidar_pcd_dir / f"lidar_{image_index:05d}.pcd"
+        write_pcd_ascii(pcd_path, xyz_mid)
+
+        # 5b) Save rich NPZ with extra metadata
+        npz_path = lidar_npz_dir / f"lidar_{image_index:05d}.npz"
+        write_lidar_npz(
+            npz_path,
+            xyz_mid,
+            refl_mid,
+            ts_mid,
+            idx0,
+            idx1,
+        )
+
+        print(f"[INFO] Saved LiDAR for image_{image_index:05d} → {pcd_path.name}, {npz_path.name}")
+
 
 
 
