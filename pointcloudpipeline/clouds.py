@@ -305,6 +305,8 @@ def interpolate_luminar_frames(arr0, arr1, t=0.5, azimuth_bins=36000):
     # --- Perform linear interpolation ---
     # Convert t to float to ensure proper arithmetic
     t = float(t)
+
+    t = max(0.0, min(1.0, float(t))) # ensure t is between 0 and 1
     
     # Interpolate XYZ coordinates: (1-t)*point0 + t*point1
     # Stack into (M, 3) array where each row is [x, y, z]
@@ -523,6 +525,46 @@ def load_luminar_clouds(bag_path: Path, topic: str = "/luminar_front/points/exis
     clouds.sort(key=lambda x: x[0])
     return clouds
 
+def cloud_indices(clouds):
+    """
+    Returns the timestamps of the cloud frames.
+    """
+    return np.array([ts for ts, _ in clouds], dtype=np.int64)
+
+def load_camera():
+    """
+    Loads all camera frames from a ROS bag. Saves each one in a separate image file. Returns 
+    a list of timestamps. 
+
+    also writes to a index file.
+    """
+
+def find_surrounding_cloud_indices(timestamp, cloud_timestamps):
+    """
+    Finds the nearest 2 cloud indices to the given timestamp.
+    """
+    i = np.searchsorted(cloud_timestamps, timestamp)
+    if i == 0:
+        return 0, 0
+    if i >= len(cloud_timestamps):
+        return len(cloud_timestamps) - 1, len(cloud_timestamps) - 1
+    return i - 1, i
+
+def calculate_camera_to_lidar_transform():
+    """
+    Inputs: 
+    - list of timestamps from the camera
+    - list of timestamps from the lidar
+    Outputs:
+    - for each camera frame, the nearest 2 lidar point clouds
+    - scalar value needed to interpolate the camera frame to the nearest 2 lidar point cloud
+    """
+
+def iteratively_call_luminar_interpolation():
+    """
+    this could just be main:
+
+    """
 
 def main():
     """
