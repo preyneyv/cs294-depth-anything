@@ -1,6 +1,7 @@
 pillow
 numpy
 rosbags
+mcap-ros2-support
 plotly
 nbformat
 scipy
