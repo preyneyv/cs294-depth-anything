@@ -365,10 +365,12 @@ def show_cloud(*xyzs, max_points=200_000):
 
         # Downsample for performance if the cloud is too large
         # This prevents browser crashes and slow rendering with millions of points
+        # Note: Changed to new formula.
         if len(xyz) > max_points:
-            # Calculate step size for uniform downsampling
-            # e.g., if we have 500k points and max_points=200k, step=2 (take every 2nd point)
-            step = len(xyz) // max_points
+            # Calculate step size for uniform downsampling using ceiling division
+            # This ensures we get at most max_points points
+            # e.g., if we have 500k points and max_points=200k, step=3 (take every 3rd point) → ~166k points
+            step = (len(xyz) + max_points - 1) // max_points
             xyz = xyz[::step]  # Slice with step to downsample
         
         # Create a Plotly 3D scatter trace for this point cloud
