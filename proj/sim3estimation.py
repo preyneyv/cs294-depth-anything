@@ -1,182 +1,123 @@
+import os
 import numpy as np
-import cv2
-import plotly.graph_objects as go
-import matplotlib.pyplot as plt
 import open3d as o3d
-import copy
-import argparse
-from scipy.ndimage import median_filter
-# from align import sim3_pipeline
-# from align_teaser import sim3_teaser_pipeline
+from pathlib import Path
+from tqdm import tqdm
+from align_teaser import sim3_teaser_pipeline
+import json
 
+# === Batch SIM(3) Alignment Pipeline ===
+# Folder structure expected:
+# dataset/
+#   depth/
+#     depth_00001.npy
+#     depth_00002.npy
+#   lidar/
+#     lidar_00001.pcd
+#     lidar_00002.pcd
 
-def robust_reciprocal(depth_img, eps=1e-3,
-                      pmin=0.01, pmax=99.5,
-                      median_ks=3, bilateral_d=9, bilateral_sigma=75):
-    # normalize to [0,1]
-    inv = depth_img/depth_img.max()
+DATA_ROOT = Path("../dataset")
+DEPTH_DIR = DATA_ROOT / "depth"
+LIDAR_DIR = DATA_ROOT / "lidar"
+OUTPUT_DIR = DATA_ROOT / "aligned"
+OUTPUT_DIR.mkdir(exist_ok=True)
 
-    # percentile clipping (remove outliers)
-    lo = np.percentile(inv, pmin)
-    hi = np.percentile(inv, pmax)
-    inv_clipped = np.clip(inv, lo, hi)
+META_PATH = OUTPUT_DIR / "metadata.jsonl"  # store full metadata per index
 
-    # optional median filter to remove salt-and-pepper
-    # inv_clipped = median_filter(inv_clipped, size=median_ks)
-
-    # avoid exact zero
-    inv_smooth = np.clip(inv_clipped, eps, 1.0)
-
-    # invert to get relative depth (Z ∝ 1 / inv)
-    z = 1.0 / inv_smooth
-
-    # optional normalize to [0,1] for visualization or to [0,255] for point cloud scaling
-    # z = (z - z.min()) / (z.max() - z.min())
-
-    return z
-
-
-# Step1: proj 2D depth image to 3D cloud points
-# Intrinsic matrix from hw4
-K = np.array([[493.9573761039707, 0.0, 517.5669208422318], # s=0
-              [0.0, 493.39913655467205, 384.5477507228477],
-              [0.0, 0.0, 1.0]])
-
+# Camera intrinsics
+K = np.array([
+    [491.331107883326, 0.0, 515.3434363622374],
+    [0.0, 492.14998153326013, 388.93983736974667],
+    [0.0, 0.0, 1.0]
+])
 fx, fy = K[0, 0], K[1, 1]
 cx, cy = K[0, 2], K[1, 2]
 
-# Depth image: H x W
-depth = np.load('./test_data/vanilla_depth_raw_20241105_071643.npy') # Load your depth image here (shape H x W, values are depth)
 
-# print(depth.shape)
+def backproject_depth(depth_img):
+    h, w = depth_img.shape
+    u, v = np.meshgrid(np.arange(w), np.arange(h))
+    depth_flat = depth_img.flatten().astype(np.float32)
+    u_flat = u.flatten()
+    v_flat = v.flatten()
 
-# Create meshgrid of pixel coordinates
-h, w = depth.shape
-u, v = np.meshgrid(np.arange(w), np.arange(h))
+    depth_flat = 1.0 / depth_flat
 
-# Flatten arrays for vectorized computation
-u_flat = u.flatten()
-v_flat = v.flatten()
-depth_flat = depth.flatten()  # depth at each pixel
-# depth_flat = depth
+    X = (u_flat - cx) * depth_flat / fx
+    Y = (v_flat - cy) * depth_flat / fy
+    Z = depth_flat
 
-# [PREPROCESS TO THE DEPTH IMAGE, CHECK MANUALLY] reverse depth for non-metric depth image, make 255(white, close)->0(black, remote)
-depth_flat = 1.0 / depth_flat
-# depth_flat = np.sort(depth_flat)
-# depth_flat = np.clip(depth_flat, 0, 20)
+    pts = np.vstack((X, Y, Z)).T
 
+    # Remove sky points. 0.5's setting is important
+    valid = depth_flat < 0.5
+    pts = pts[valid]
 
-# Optional: use the packed function. Similar point cloud.
-# depth_flat = robust_reciprocal(depth_flat, eps=2e-3, pmin=0.01, pmax=99.5)
+    # [CHECK THIS MANUALLY]
+    # post-process to get x-y-z axis in the same direction with LiDAR pcd
+    pts[:, 1] = -pts[:, 1] # invert y axis
+    # Filter by x-range, rm noisy points
+    mask = (pts[:, 0] > -0.01) & (pts[:, 0] < 0.01)
+    pts = pts[mask]
 
-# [LINEAR PROJECTION, MATHEMATICALLY WRONG] this has the best output, although mathematically it is wrong
-# depth_flat = depth_flat.max() - depth_flat
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(pts)
 
-# Back-project
-X = (u_flat - cx) * depth_flat / fx
-Y = (v_flat - cy) * depth_flat / fy
-Z = depth_flat
+    # [optional] downsample to save memory for quick test
+    pcd = pcd.voxel_down_sample(voxel_size=1e-4)
 
-# Stack into point cloud: shape (N, 3)
-points_3d = np.vstack((X, Y, Z)).T
-print(points_3d.shape)
-
-# Remove sky points
-valid = depth_flat < 0.5
-points_3d = points_3d[valid]
-
-pcd_cam = o3d.geometry.PointCloud()
-pcd_cam.points = o3d.utility.Vector3dVector(points_3d)
-
-# [optional] downsample to save memory for quick test
-pcd_cam = pcd_cam.voxel_down_sample(voxel_size=1e-4)
-
-points_cam = np.asarray(pcd_cam.points).copy()
-points_cam[:, 1] = -points_cam[:, 1]   # invert y axis
-
-# Filter by x-range
-mask = (points_cam[:, 0] > -0.01) & (points_cam[:, 0] < 0.01)
-points_cam = points_cam[mask]
-
-# [optional] visualize the point cloud
-fig = go.Figure(data=[go.Scatter3d(
-    x=points_cam[:, 0],
-    y=points_cam[:, 1],
-    z=points_cam[:, 2],
-    mode='markers',
-    marker=dict(size=1, opacity=0.8)
-)])
-
-fig.update_layout(scene=dict(
-    xaxis=dict(title='X'),
-    yaxis=dict(title='Y', autorange='reversed'),
-    zaxis=dict(title='Z'),
-    aspectmode='data',
-))
-fig.show()
+    return pcd
 
 
-# Step2: Estimate s, R, T between the two 3D cloud points
-# Load the LiDAR pointcloud
-pcd_lidar = o3d.io.read_point_cloud('./test_data/point_cloud_20241105_071643.pcd')
+def process_pair(idx):
+    depth_path = DEPTH_DIR / f"depth_{idx}.npy"
+    lidar_path = LIDAR_DIR / f"lidar_{idx}.pcd"
 
-# [optional] downsample to save memory for quick test
-# pcd_lidar = pcd_lidar.voxel_down_sample(voxel_size=1)
+    if not depth_path.exists() or not lidar_path.exists():
+        print(f"[SKIP] Missing pair for index {idx}")
+        return
 
-points_lidar = np.asarray(pcd_lidar.points)  # points in LiDAR frame
+    depth = np.load(depth_path)
+    pcd_cam = backproject_depth(depth)
+    points_cam = np.asarray(pcd_cam.points).copy()
 
-# [CHECK THE AXIS MANUALLY] Remap axes: (y, z, x) --> (x, y, z)
-points_lidar = points_lidar[:, [1, 2, 0]]  # swap axes
-points_lidar[:, 0] = -points_lidar[:, 0]   # invert x axis
-pcd_lidar.points = o3d.utility.Vector3dVector(points_lidar)
+    pcd_lidar = o3d.io.read_point_cloud(str(lidar_path))
 
-# [optional] visualize the point cloud
-fig = go.Figure(data=[go.Scatter3d(
-    x=points_lidar[:, 0],
-    y=points_lidar[:, 1],
-    z=points_lidar[:, 2],
-    mode='markers',
-    marker=dict(size=1, opacity=0.8)
-)])
+    # [CHECK THE AXIS MANUALLY] post-process to get x-y-z axis
+    pts_lidar = np.asarray(pcd_lidar.points)[:, [1, 2, 0]] # Remap axes: (y, z, x) --> (x, y, z)
+    pts_lidar[:, 0] = -pts_lidar[:, 0] # invert x axis
 
-fig.update_layout(scene=dict(
-    xaxis=dict(title='X', autorange='reversed'),
-    yaxis=dict(title='Y'),
-    zaxis=dict(title='Z'),
-    aspectmode='data',
-))
-fig.show()
+    pcd_lidar.points = o3d.utility.Vector3dVector(pts_lidar)
 
-# pcd = o3d.io.read_point_cloud('./test_data/cam_aligned.pcd')  # Update the path
-# points = np.asarray(pcd.points)  # Extract XYZ coordinates
-#
-# # Plot using Plotly
-# fig = go.Figure(data=[go.Scatter3d(
-#     x=points[:, 0],
-#     y=points[:, 1],
-#     z=points[:, 2],
-#     mode='markers',
-#     marker=dict(size=2, opacity=0.8)  # Adjust size if needed
-# )])
-#
-# fig.update_layout(
-#     title="Camera Aligned Result Visualization",
-#     scene=dict(
-#         xaxis=dict(title='X'),
-#         yaxis=dict(title='Y'),
-#         zaxis=dict(title='Z'),
-#         aspectmode='data',
-#     )
-# )
-# fig.show()
+    # [optional] downsample to save memory for quick test
+    pcd_lidar = pcd_lidar.voxel_down_sample(voxel_size=1)
 
-# pcd_cam, pcd_lidar, args.noise, corr_cam, corr_lidar, verbose=True)
-cam_aligned, metadata = sim3_teaser_pipeline(pcd_cam, pcd_lidar, 0.05, points_cam, points_lidar, verbose=True)
+    cam_aligned, metadata = sim3_teaser_pipeline(
+        pcd_cam,
+        pcd_lidar,
+        0.05,
+        points_cam,
+        pts_lidar,
+        verbose=False
+    )
 
-print("Best scale:", metadata["s"])
-print("Best fitness:", metadata["fitness"], "RMSE:", metadata["rmse"])
-# save
-o3d.io.write_point_cloud("cam_aligned.ply", cam_aligned)
-print("Aligned camera cloud written to cam_aligned.ply")
+    save_path = OUTPUT_DIR / f"cam_aligned_{idx}.ply"
+    o3d.io.write_point_cloud(str(save_path), cam_aligned)
+
+    metadata["index"] = idx
+    with open(META_PATH, "a") as f:
+        f.write(json.dumps(metadata, default=str) + "\n")
+
+    print(f"[DONE] {idx} saved → cam_aligned_{idx}.ply")
 
 
+if __name__ == "__main__":
+    all_depth = sorted([f.name.split("_")[1].split(".")[0] for f in DEPTH_DIR.glob("*.npy")])
+
+    with open(META_PATH, "w") as f:
+        pass
+
+    for idx in tqdm(all_depth, desc="Aligning batch", ncols=100):
+        process_pair(idx)
+
+    print("Batch complete! Full metadata stored in metadata.jsonl")
