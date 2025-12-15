@@ -33,6 +33,7 @@ python depth_generation_all.py --midas
 python depth_generation_all.py --midas_small
 python depth_generation_all.py --marigold
 python depth_generation_all.py --depth_pro
+```
 ---
 
 ## 🚀 BUGS
