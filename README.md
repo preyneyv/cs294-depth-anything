@@ -6,6 +6,35 @@ In order to run the Teaser++ pipeline, you can simply download the `/proj` folde
 
 ---
 
+## Depth Models Instructions
+pip install numpy opencv-python torch torchvision tqdm pillow matplotlib
+
+```
+pip install timm
+pip install diffusers transformers accelerate
+pip install xformers  # CUDA only
+
+#Depth Pro
+git clone https://github.com/apple/ml-depth-pro
+cd ml-depth-pro
+pip install -e .
+source get_pretrained_models.sh
+
+```
+(did not include depth anything v2 since already have)
+
+(note that Midas outputs invese depth)
+
+### For inferene
+
+```
+python depth_generation_all.py --depth_anything_v2
+python depth_generation_all.py --midas
+python depth_generation_all.py --midas_small
+python depth_generation_all.py --marigold
+python depth_generation_all.py --depth_pro
+---
+
 ## 🚀 BUGS
 In the `sim3estimation.py`, there are several comments about WRONG implementations such as the wrong reverse process and the integer depth. NOT FIXED YET.
 - Bug1: The two extreme points 0 and 255 are reversed. But the current code simply use `255-PixelValue` to reverse it back which is not corresponding to the Relative-version DepthAnythingV2. NOT FIXED YET.
