@@ -7,9 +7,9 @@ In order to run the Teaser++ pipeline, you can simply download the `/proj` folde
 ---
 
 ## Depth Models Instructions
+```
 pip install numpy opencv-python torch torchvision tqdm pillow matplotlib
 
-```
 pip install timm
 pip install diffusers transformers accelerate
 pip install xformers  # CUDA only
