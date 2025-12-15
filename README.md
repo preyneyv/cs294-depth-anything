@@ -23,7 +23,7 @@ source get_pretrained_models.sh
 ```
 (did not include depth anything v2 since already have)
 
-(note that Midas outputs invese depth)
+**note that depthpro and marigold outputs invese depth for depthpro do 1/depth and for marigold do 1-depth**
 
 ### For inferene
 
