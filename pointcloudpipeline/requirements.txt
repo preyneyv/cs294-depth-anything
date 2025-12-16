@@ -1,7 +1,9 @@
 pillow
 numpy
 rosbags
+rosbags-image
 mcap-ros2-support
 plotly
 nbformat
 scipy
+opencv-python

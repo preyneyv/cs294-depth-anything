@@ -610,11 +610,16 @@ def load_camera(bag_path: Path,
         
         if not connections:
             raise ValueError(f"Camera topic '{camera_topic}' not found in bag file. "
-                           f"Available topics: {[c.topic for c in reader.connections]}")
+                           f"Available image topics: {[c.topic for c in reader.connections if '/image' in c.topic]}")
         
         # Check if it's compressed or regular image
         conn = connections[0]
         is_compressed = 'CompressedImage' in conn.msgtype
+        
+        # Debug: Print topic information
+        print(f"[DEBUG] Using camera topic: {camera_topic}")
+        print(f"[DEBUG] Message type: {conn.msgtype}")
+        print(f"[DEBUG] Is compressed: {is_compressed}")
         
         count = 0
         for conn, timestamp, raw_msg in reader.messages(connections=connections):
@@ -630,6 +635,17 @@ def load_camera(bag_path: Path,
                     img = message_to_cvimage(msg)
                 else:
                     img = decode_image_message(msg)
+            
+            # Debug: Print image properties (only for first image to avoid spam)
+            if count == 0:
+                print(f"[DEBUG] First image shape: {img.shape} (H, W, C)")
+                print(f"[DEBUG] First image dtype: {img.dtype}")
+                if hasattr(msg, 'width') and hasattr(msg, 'height'):
+                    print(f"[DEBUG] Message resolution: {msg.width}x{msg.height}")
+                    if img.shape[:2] != (msg.height, msg.width):
+                        print(f"[WARN] Resolution mismatch: image shape {img.shape[:2]} != message {msg.height}x{msg.width}")
+                if hasattr(msg, 'encoding'):
+                    print(f"[DEBUG] Message encoding: {msg.encoding}")
             
             # Save as PNG
             idx = count

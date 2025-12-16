@@ -6,6 +6,7 @@ Compares actual image dimensions with what the K matrix expects.
 Helps identify resolution mismatches that cause undistortion failures.
 
 Usage:
+    python check_image_dimensions.py --rosbag dpt_rosbag_lvms_2024_12/rosbag2_2024_12_12-18_21_55_12.mcap --image-topic /vimba_front/image --camera-info-topic /vimba_front/camera_info
     python check_image_dimensions.py --image image.png --camera-info camera_info.yaml
     python check_image_dimensions.py --image image.png --k "[[fx,0,cx],[0,fy,cy],[0,0,1]]" --resolution 2064x1544
     python check_image_dimensions.py --rosbag bag.mcap --topic /vimba_front/image --camera-info-topic /vimba_front/camera_info
