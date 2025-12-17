@@ -42,6 +42,14 @@ K = np.array([
 fx, fy = K[0, 0], K[1, 1]
 cx, cy = K[0, 2], K[1, 2]
 
+# Point cloud downsampling parameters 
+# CAMERA_PCD_VOXEL_SIZE = 1e-4 # earlier default setting
+# CAMERA_PCD_VOXEL_SIZE = 0.2 # for regular eval
+CAMERA_PCD_VOXEL_SIZE = 0.2 # for fast test
+LIDAR_PCD_VOXEL_SIZE = 2.0 # 1.0 default
+MAX_POINTS_AFTER_DOWNSAMPLE = 5000  # Cap point count after downsampling for guaranteed runtime
+
+
 
 def backproject_depth(depth_img):
     h, w = depth_img.shape
@@ -73,13 +81,22 @@ def backproject_depth(depth_img):
     pcd = o3d.geometry.PointCloud()
     pcd.points = o3d.utility.Vector3dVector(pts)
 
-    # [optional] downsample to save memory for quick test
-    pcd = pcd.voxel_down_sample(voxel_size=1e-4)
+    # Downsample to reduce point count for faster processing
+    n_pre = len(pcd.points)
+    pcd = pcd.voxel_down_sample(voxel_size=CAMERA_PCD_VOXEL_SIZE)
+    n_post = len(pcd.points)
+    
+    # Cap point count for guaranteed runtime
+    if n_post > MAX_POINTS_AFTER_DOWNSAMPLE:
+        # Randomly sample to max points
+        indices = np.random.choice(n_post, MAX_POINTS_AFTER_DOWNSAMPLE, replace=False)
+        pcd = pcd.select_by_index(indices)
+        n_post = MAX_POINTS_AFTER_DOWNSAMPLE
 
-    return pcd
+    return pcd, n_pre, n_post
 
 
-def process_pair(idx, depth_dir, depth_method, meta_path, verbose=False):
+def process_pair(idx, depth_dir, depth_method, meta_path, verbose=False, estimate_scaling=True):
     """
     Process a single depth-LiDAR pair.
     
@@ -102,18 +119,24 @@ def process_pair(idx, depth_dir, depth_method, meta_path, verbose=False):
 
     depth = np.load(depth_path)
     if verbose:
-        print(f"  [{idx}] Depth shape: {depth.shape}, backprojecting to point cloud...")
+        print(f"  [{idx:05d}] Depth shape: {depth.shape}, backprojecting to point cloud...")
     
-    pcd_cam = backproject_depth(depth)
+    pcd_cam, n_cam_pre, n_cam_post = backproject_depth(depth)
     points_cam = np.asarray(pcd_cam.points).copy()
     
-    if verbose:
-        print(f"  [{idx}] Camera PCD: {len(points_cam)} points")
+    print(f"  [{idx:05d}] cam points pre-voxel: {n_cam_pre}")
+    print(f"  [{idx:05d}] cam points post-voxel: {n_cam_post}")
+    
+    n_cam = len(pcd_cam.points)
+    if n_cam < 100:
+        print(f"  [{idx:05d}] SKIP: too few camera points (cam={n_cam})")
+        return None
 
     pcd_lidar = o3d.io.read_point_cloud(str(lidar_path))
     
+    n_lidar_pre = len(pcd_lidar.points)
     if verbose:
-        print(f"  [{idx}] LiDAR PCD: {len(pcd_lidar.points)} points, processing axes...")
+        print(f"  [{idx:05d}] LiDAR PCD: {n_lidar_pre} points, processing axes...")
 
     # [CHECK THE AXIS MANUALLY] post-process to get x-y-z axis
     pts_lidar = np.asarray(pcd_lidar.points)[:, [1, 2, 0]] # Remap axes: (y, z, x) --> (x, y, z)
@@ -121,11 +144,37 @@ def process_pair(idx, depth_dir, depth_method, meta_path, verbose=False):
 
     pcd_lidar.points = o3d.utility.Vector3dVector(pts_lidar)
 
-    # [optional] downsample to save memory for quick test
-    pcd_lidar = pcd_lidar.voxel_down_sample(voxel_size=1)
+    # Downsample to reduce point count for faster processing
+    print(f"  [{idx:05d}] lidar points pre-voxel: {n_lidar_pre}")
+    pcd_lidar = pcd_lidar.voxel_down_sample(voxel_size=LIDAR_PCD_VOXEL_SIZE)
+    n_lidar_post = len(pcd_lidar.points)
+    
+    # Cap point count for guaranteed runtime
+    if n_lidar_post > MAX_POINTS_AFTER_DOWNSAMPLE:
+        indices = np.random.choice(n_lidar_post, MAX_POINTS_AFTER_DOWNSAMPLE, replace=False)
+        pcd_lidar = pcd_lidar.select_by_index(indices)
+        n_lidar_post = MAX_POINTS_AFTER_DOWNSAMPLE
+    
+    print(f"  [{idx:05d}] lidar points post-voxel: {n_lidar_post}")
+    
+    n_lidar = len(pcd_lidar.points)
+    if n_lidar < 100:
+        print(f"  [{idx:05d}] SKIP: too few LiDAR points (lidar={n_lidar})")
+        return None
+    
+    # Guard: ensure we have enough points before TEASER++
+    if n_cam < 100 or n_lidar < 100:
+        print(f"  [{idx:05d}] SKIP: too few points (cam={n_cam}, lidar={n_lidar})")
+        return None
+    
+    # Guard: ensure at least 3 correspondences (minimum for 3D transformation)
+    n_corr = min(len(points_cam), len(pts_lidar))
+    if n_corr < 3:
+        print(f"  [{idx:05d}] SKIP: too few correspondences (n={n_corr}, need >= 3)")
+        return None
     
     if verbose:
-        print(f"  [{idx}] Running TEASER++ alignment (this may take a moment)...")
+        print(f"  [{idx:05d}] Running TEASER++ alignment (this may take a moment)...")
 
     cam_aligned, metadata = sim3_teaser_pipeline(
         pcd_cam,
@@ -133,7 +182,8 @@ def process_pair(idx, depth_dir, depth_method, meta_path, verbose=False):
         0.05,
         points_cam,
         pts_lidar,
-        verbose=verbose
+        verbose=verbose,
+        estimate_scaling=estimate_scaling
     )
     
     if verbose:
@@ -155,7 +205,7 @@ def process_pair(idx, depth_dir, depth_method, meta_path, verbose=False):
     return save_path
 
 
-def process_depth_method(depth_method, depth_dir, limit=None, test_mode=False):
+def process_depth_method(depth_method, depth_dir, limit=None, test_mode=False, estimate_scaling=True):
     """
     Process all files for a given depth method.
     
@@ -197,7 +247,7 @@ def process_depth_method(depth_method, depth_dir, limit=None, test_mode=False):
     
     processed = 0
     for idx in tqdm(all_indices, desc=f"Aligning {depth_method}", ncols=100, disable=test_mode):
-        result = process_pair(idx, depth_dir, depth_method, meta_path, verbose=test_mode)
+        result = process_pair(idx, depth_dir, depth_method, meta_path, verbose=test_mode, estimate_scaling=estimate_scaling)
         if result:
             processed += 1
     
@@ -227,6 +277,11 @@ if __name__ == "__main__":
         action="store_true",
         help="Test mode: process only first 3 files per method"
     )
+    parser.add_argument(
+        "--no-scale",
+        action="store_true",
+        help="Disable scale estimation in TEASER++ (faster, more stable for debugging)"
+    )
     args = parser.parse_args()
     
     # Determine which methods to process
@@ -240,6 +295,10 @@ if __name__ == "__main__":
         print("TEST MODE: Processing only first 3 files per method")
     elif args.limit:
         print(f"LIMIT MODE: Processing only first {args.limit} files per method")
+    if args.no_scale:
+        print("SCALE ESTIMATION: DISABLED (faster, more stable)")
+    
+    estimate_scaling = not args.no_scale
     
     total_processed = 0
     for method in methods_to_process:
@@ -248,7 +307,8 @@ if __name__ == "__main__":
             method, 
             depth_dir, 
             limit=args.limit,
-            test_mode=args.test
+            test_mode=args.test,
+            estimate_scaling=estimate_scaling
         )
         total_processed += processed
     
