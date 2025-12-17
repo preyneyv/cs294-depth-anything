@@ -14,6 +14,8 @@ pip install timm
 pip install diffusers transformers accelerate
 pip install xformers  # CUDA only
 
+## Note: Depth Pro may want to be run separately, there's a conflict with depth opencv-python
+
 #Depth Pro
 git clone https://github.com/apple/ml-depth-pro
 cd ml-depth-pro
