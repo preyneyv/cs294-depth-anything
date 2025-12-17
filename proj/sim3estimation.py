@@ -119,24 +119,24 @@ def process_pair(idx, depth_dir, depth_method, meta_path, verbose=False, estimat
 
     depth = np.load(depth_path)
     if verbose:
-        print(f"  [{idx:05d}] Depth shape: {depth.shape}, backprojecting to point cloud...")
+        print(f"  [{idx}] Depth shape: {depth.shape}, backprojecting to point cloud...")
     
     pcd_cam, n_cam_pre, n_cam_post = backproject_depth(depth)
     points_cam = np.asarray(pcd_cam.points).copy()
     
-    print(f"  [{idx:05d}] cam points pre-voxel: {n_cam_pre}")
-    print(f"  [{idx:05d}] cam points post-voxel: {n_cam_post}")
+    print(f"  [{idx}] cam points pre-voxel: {n_cam_pre}")
+    print(f"  [{idx}] cam points post-voxel: {n_cam_post}")
     
     n_cam = len(pcd_cam.points)
     if n_cam < 100:
-        print(f"  [{idx:05d}] SKIP: too few camera points (cam={n_cam})")
+        print(f"  [{idx}] SKIP: too few camera points (cam={n_cam})")
         return None
 
     pcd_lidar = o3d.io.read_point_cloud(str(lidar_path))
     
     n_lidar_pre = len(pcd_lidar.points)
     if verbose:
-        print(f"  [{idx:05d}] LiDAR PCD: {n_lidar_pre} points, processing axes...")
+        print(f"  [{idx}] LiDAR PCD: {n_lidar_pre} points, processing axes...")
 
     # [CHECK THE AXIS MANUALLY] post-process to get x-y-z axis
     pts_lidar = np.asarray(pcd_lidar.points)[:, [1, 2, 0]] # Remap axes: (y, z, x) --> (x, y, z)
@@ -145,7 +145,7 @@ def process_pair(idx, depth_dir, depth_method, meta_path, verbose=False, estimat
     pcd_lidar.points = o3d.utility.Vector3dVector(pts_lidar)
 
     # Downsample to reduce point count for faster processing
-    print(f"  [{idx:05d}] lidar points pre-voxel: {n_lidar_pre}")
+    print(f"  [{idx}] lidar points pre-voxel: {n_lidar_pre}")
     pcd_lidar = pcd_lidar.voxel_down_sample(voxel_size=LIDAR_PCD_VOXEL_SIZE)
     n_lidar_post = len(pcd_lidar.points)
     
@@ -155,26 +155,26 @@ def process_pair(idx, depth_dir, depth_method, meta_path, verbose=False, estimat
         pcd_lidar = pcd_lidar.select_by_index(indices)
         n_lidar_post = MAX_POINTS_AFTER_DOWNSAMPLE
     
-    print(f"  [{idx:05d}] lidar points post-voxel: {n_lidar_post}")
+    print(f"  [{idx}] lidar points post-voxel: {n_lidar_post}")
     
     n_lidar = len(pcd_lidar.points)
     if n_lidar < 100:
-        print(f"  [{idx:05d}] SKIP: too few LiDAR points (lidar={n_lidar})")
+        print(f"  [{idx}] SKIP: too few LiDAR points (lidar={n_lidar})")
         return None
     
     # Guard: ensure we have enough points before TEASER++
     if n_cam < 100 or n_lidar < 100:
-        print(f"  [{idx:05d}] SKIP: too few points (cam={n_cam}, lidar={n_lidar})")
+        print(f"  [{idx}] SKIP: too few points (cam={n_cam}, lidar={n_lidar})")
         return None
     
     # Guard: ensure at least 3 correspondences (minimum for 3D transformation)
     n_corr = min(len(points_cam), len(pts_lidar))
     if n_corr < 3:
-        print(f"  [{idx:05d}] SKIP: too few correspondences (n={n_corr}, need >= 3)")
+        print(f"  [{idx}] SKIP: too few correspondences (n={n_corr}, need >= 3)")
         return None
     
     if verbose:
-        print(f"  [{idx:05d}] Running TEASER++ alignment (this may take a moment)...")
+        print(f"  [{idx}] Running TEASER++ alignment (this may take a moment)...")
 
     cam_aligned, metadata = sim3_teaser_pipeline(
         pcd_cam,
