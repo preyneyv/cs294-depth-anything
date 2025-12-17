@@ -15,9 +15,10 @@ def get_teaser_solver(noise_bound, estimate_scaling=True):
     params.estimate_scaling = estimate_scaling
 
     # choose a rotation estimation algorithm
-    params.rotation_estimation_algorithm = (
-        teaserpp_python.RobustRegistrationSolver.ROTATION_ESTIMATION_ALGORITHM.GNC_TLS
-    )
+    # params.rotation_estimation_algorithm = (
+    #     teaserpp_python.RobustRegistrationSolver.ROTATION_ESTIMATION_ALGORITHM.GNC_TLS
+    # )
+    params.rotation_estimation_algorithm = teaserpp_python.RotationEstimationAlgorithm.GNC_TLS
     params.rotation_gnc_factor = 1.4
     params.rotation_max_iterations = 100
     params.rotation_cost_threshold = 1e-12
@@ -26,13 +27,19 @@ def get_teaser_solver(noise_bound, estimate_scaling=True):
     solver = teaserpp_python.RobustRegistrationSolver(params)
     return solver
 
-def compute_teaser_transform(src_corr: np.ndarray, dst_corr: np.ndarray, noise_bound):
+def compute_teaser_transform(src_corr: np.ndarray, dst_corr: np.ndarray, noise_bound, estimate_scaling=True):
     """
     Run TEASER++ solver on corresponding 3D points to estimate (s, R, t).
     src_corr, dst_corr: np.ndarray, shape (3, N) for N correspondences.
+    estimate_scaling: If False, disable scale estimation (faster, more stable for debugging)
     Returns: scale (float), R (3x3), t (3,)
     """
-    solver = get_teaser_solver(noise_bound=noise_bound, estimate_scaling=True)
+    # Guard: ensure at least 3 correspondences
+    n_corr = src_corr.shape[1]
+    if n_corr < 3:
+        raise ValueError(f"TEASER++ requires at least 3 correspondences, got {n_corr}")
+    
+    solver = get_teaser_solver(noise_bound=noise_bound, estimate_scaling=estimate_scaling)
     solver.solve(src_corr, dst_corr)
     solution = solver.getSolution()
     s = solution.scale
@@ -87,7 +94,7 @@ def evaluate(source, target, transformation, max_dist):
     )
     return eval_res.fitness, eval_res.inlier_rmse
 
-def sim3_teaser_pipeline(pcd_cam, pcd_lidar, noise_bound, corr_src_pts, corr_dst_pts, verbose=True):
+def sim3_teaser_pipeline(pcd_cam, pcd_lidar, noise_bound, corr_src_pts, corr_dst_pts, verbose=True, estimate_scaling=True):
     """
     Full TEASER++ pipeline (without feature matching):
     - Takes in pre-computed correspondences (corr_src_pts, corr_dst_pts)
@@ -96,13 +103,20 @@ def sim3_teaser_pipeline(pcd_cam, pcd_lidar, noise_bound, corr_src_pts, corr_dst
     - Applies to camera cloud
     - Refines with ICP
     - Returns aligned cloud and metadata
+    
+    estimate_scaling: If False, disable scale estimation (faster, more stable for debugging)
     """
 
     # TEASER++ requires shapes (3, N)
     src_corr = corr_src_pts.T
     dst_corr = corr_dst_pts.T
+    
+    # Guard: ensure at least 3 correspondences
+    n_corr = src_corr.shape[1]
+    if n_corr < 3:
+        raise ValueError(f"TEASER++ requires at least 3 correspondences, got {n_corr}")
 
-    s, R, t = compute_teaser_transform(src_corr, dst_corr, noise_bound=noise_bound)
+    s, R, t = compute_teaser_transform(src_corr, dst_corr, noise_bound=noise_bound, estimate_scaling=estimate_scaling)
     if verbose:
         print(f"TEASER++ result: scale {s}, translation {t}, rotation:\n{R}")
 

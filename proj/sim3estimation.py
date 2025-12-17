@@ -45,8 +45,8 @@ cx, cy = K[0, 2], K[1, 2]
 # Point cloud downsampling parameters 
 # CAMERA_PCD_VOXEL_SIZE = 1e-4 # earlier default setting
 # CAMERA_PCD_VOXEL_SIZE = 0.2 # for regular eval
-CAMERA_PCD_VOXEL_SIZE = 0.2 # for fast test
-LIDAR_PCD_VOXEL_SIZE = 2.0 # 1.0 default
+CAMERA_PCD_VOXEL_SIZE = 1e-3 # for fast test
+LIDAR_PCD_VOXEL_SIZE = 0.5 # 1.0 default
 MAX_POINTS_AFTER_DOWNSAMPLE = 5000  # Cap point count after downsampling for guaranteed runtime
 
 
