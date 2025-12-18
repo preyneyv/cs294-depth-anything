@@ -52,8 +52,8 @@ CAMERA_PCD_VOXEL_SIZES = {
     "depth": 0.05,      # Dense relative method
     "depth_v3": 0.05,   # Dense relative method (or metric if raw mode)
     "marigold": 0.05,   # Dense relative method
-    "midas": 0.05,      # Dense relative method
-    "midas_small": 0.05, # Dense relative method
+    "midas": 0.5,      # Dense relative method
+    "midas_small": 0.5, # Dense relative method
     "depth_pro": 0.05,  # Metric method - keep at 1e-3 to preserve behavior
 }
 # Default fallback
@@ -688,7 +688,9 @@ def find_correspondences_fpfh(feats0, feats1, mutual_filter=True):
 
 def process_pair(idx, depth_dir, depth_method, meta_path, verbose=False, estimate_scaling=True, depth_mode="auto", is_first_frame=False,
                  crop_z_min=2.0, crop_z_max=50.0, crop_fov_scale=0.8, viz=False, viz_after=False, viz_frame_idx=0, k_scale=2.0,
-                 rel_crop_min_pct=2, rel_crop_max_pct=95, rel_crop_invert=False, max_teaser_corr=800):
+                 rel_crop_min_pct=2, rel_crop_max_pct=95, rel_crop_invert=False, max_teaser_corr=800,
+                 auto_metricize=False, auto_metricize_p_low=5, auto_metricize_p_high=95,
+                 auto_metricize_z_low=None, auto_metricize_z_high=None):
     """
     Process a single depth-LiDAR pair.
     
@@ -735,21 +737,58 @@ def process_pair(idx, depth_dir, depth_method, meta_path, verbose=False, estimat
     # Preprocess depth based on method (pass resolved mode)
     depth_processed = preprocess_depth(depth_raw, depth_method, effective_mode)
     
-    # Print post-preprocess statistics for first frame
-    if is_first_frame:
+    # Auto-metricize: Apply affine mapping for non-metric depth methods AFTER preprocessing
+    # This ensures that, e.g., effective_mode=='inv' has already applied 1/depth before we remap to meters.
+    auto_metricize_a = None
+    auto_metricize_b = None
+    if auto_metricize and not is_metric_depth:
+        # Use crop_z_min/max as defaults if not explicitly set
+        z_low = auto_metricize_z_low if auto_metricize_z_low is not None else crop_z_min
+        z_high = auto_metricize_z_high if auto_metricize_z_high is not None else crop_z_max
+        
+        # Compute percentiles on valid depth pixels only (post-preprocess)
+        valid_mask = np.isfinite(depth_processed) & (depth_processed > 0)
+        depth_valid = depth_processed[valid_mask]
+        
+        if len(depth_valid) > 0:
+            d_low = np.percentile(depth_valid, auto_metricize_p_low)
+            d_high = np.percentile(depth_valid, auto_metricize_p_high)
+            
+            # Guard: check if percentiles are valid
+            eps = 1e-6
+            if d_high <= d_low + eps:
+                print(f"  [{idx}] WARNING: Auto-metricize skipped - invalid percentiles (d_low={d_low:.6f}, d_high={d_high:.6f})")
+            else:
+                # Compute affine parameters: depth_metric = a * depth_processed + b
+                a = (z_high - z_low) / (d_high - d_low)
+                b = z_low - a * d_low
+                
+                # Apply affine transformation in-place on processed depth
+                depth_processed = a * depth_processed + b
+                depth_processed[~valid_mask] = np.nan  # Preserve invalid pixels
+                
+                auto_metricize_a = float(a)
+                auto_metricize_b = float(b)
+                
+                print(f"  [{idx}] Auto-metricize {depth_method}: p{auto_metricize_p_low:.0f}={d_low:.6f}, p{auto_metricize_p_high:.0f}={d_high:.6f} -> z=[{z_low:.1f},{z_high:.1f}]m, a={a:.6f}, b={b:.6f}")
+        else:
+            print(f"  [{idx}] WARNING: Auto-metricize skipped - no valid depth pixels")
+    
+    # Print post-preprocess (and post-auto-metricize) statistics
+    if is_first_frame or verbose:
         valid_processed = np.isfinite(depth_processed) & (depth_processed > 0)
         n_valid = np.sum(valid_processed)
-        print(f"  [{idx}] Post-preprocess statistics:")
+        print(f"  [{idx}] Post-preprocess depth (used as Z) statistics:")
         if n_valid > 0:
             depth_valid = depth_processed[valid_processed]
+            d_min = depth_valid.min()
+            d_max = depth_valid.max()
+            p5, p95 = np.percentile(depth_valid, [5, 95])
             print(f"    Valid pixels: {n_valid} / {depth_processed.size}")
-            print(f"    Min:   {depth_valid.min():.6f}")
-            print(f"    Max:   {depth_valid.max():.6f}")
-            print(f"    Mean:  {depth_valid.mean():.6f}")
-            z_percentiles = np.percentile(depth_valid, [1, 5, 25, 50, 75, 95, 99])
-            print(f"    Z percentiles [1, 5, 25, 50, 75, 95, 99]: {z_percentiles}")
+            print(f"    Min/Max: {d_min:.6f} / {d_max:.6f} m")
+            print(f"    Percentiles p5/p95: [{p5:.6f}, {p95:.6f}] m")
         else:
-            print(f"    WARNING: No valid pixels after preprocessing!")
+            print(f"    WARNING: No valid pixels after preprocessing (and auto-metricize)!")
     
     if verbose:
         print(f"  [{idx}] Depth shape: {depth_processed.shape}, backprojecting to point cloud...")
@@ -1047,6 +1086,16 @@ def process_pair(idx, depth_dir, depth_method, meta_path, verbose=False, estimat
         metadata['inlier_ratio'] = float(inlier_ratio)
         metadata['teaser_runtime'] = teaser_time
         metadata['feature_extraction_time'] = feature_time
+        
+        # Add auto-metricize parameters if applied
+        if auto_metricize_a is not None and auto_metricize_b is not None:
+            metadata['auto_metricize_a'] = auto_metricize_a
+            metadata['auto_metricize_b'] = auto_metricize_b
+            metadata['auto_metricize_p_low'] = auto_metricize_p_low
+            metadata['auto_metricize_p_high'] = auto_metricize_p_high
+            metadata['auto_metricize_z_low'] = auto_metricize_z_low if auto_metricize_z_low is not None else crop_z_min
+            metadata['auto_metricize_z_high'] = auto_metricize_z_high if auto_metricize_z_high is not None else crop_z_max
+        
         if hasattr(ransac_result, 'fitness'):
             metadata['ransac_fitness'] = float(ransac_result.fitness)
             metadata['ransac_inlier_rmse'] = float(ransac_result.inlier_rmse)
@@ -1059,6 +1108,15 @@ def process_pair(idx, depth_dir, depth_method, meta_path, verbose=False, estimat
         metadata['correspondences_count'] = n_corr
         metadata['teaser_runtime'] = teaser_time
         metadata['feature_extraction_time'] = feature_time
+        
+        # Add auto-metricize parameters if applied
+        if auto_metricize_a is not None and auto_metricize_b is not None:
+            metadata['auto_metricize_a'] = auto_metricize_a
+            metadata['auto_metricize_b'] = auto_metricize_b
+            metadata['auto_metricize_p_low'] = auto_metricize_p_low
+            metadata['auto_metricize_p_high'] = auto_metricize_p_high
+            metadata['auto_metricize_z_low'] = auto_metricize_z_low if auto_metricize_z_low is not None else crop_z_min
+            metadata['auto_metricize_z_high'] = auto_metricize_z_high if auto_metricize_z_high is not None else crop_z_max
     
     # Visualization: post-registration
     if should_viz and viz_after:
@@ -1094,7 +1152,9 @@ def process_pair(idx, depth_dir, depth_method, meta_path, verbose=False, estimat
 
 def process_depth_method(depth_method, depth_dir, limit=None, test_mode=False, estimate_scaling=True, depth_mode_dict=None,
                          crop_z_min=2.0, crop_z_max=50.0, crop_fov_scale=0.8, viz=False, viz_after=False, viz_frame_idx=0, k_scale=2.0,
-                         rel_crop_min_pct=2, rel_crop_max_pct=95, rel_crop_invert=False, max_teaser_corr=800):
+                         rel_crop_min_pct=2, rel_crop_max_pct=95, rel_crop_invert=False, max_teaser_corr=800,
+                         auto_metricize=False, auto_metricize_p_low=5, auto_metricize_p_high=95,
+                         auto_metricize_z_low=None, auto_metricize_z_high=None):
     """
     Process all files for a given depth method.
     
@@ -1164,7 +1224,12 @@ def process_depth_method(depth_method, depth_dir, limit=None, test_mode=False, e
             rel_crop_min_pct=rel_crop_min_pct,
             rel_crop_max_pct=rel_crop_max_pct,
             rel_crop_invert=rel_crop_invert,
-            max_teaser_corr=max_teaser_corr
+            max_teaser_corr=max_teaser_corr,
+            auto_metricize=auto_metricize,
+            auto_metricize_p_low=auto_metricize_p_low,
+            auto_metricize_p_high=auto_metricize_p_high,
+            auto_metricize_z_low=auto_metricize_z_low,
+            auto_metricize_z_high=auto_metricize_z_high
         )
         if result:
             processed += 1
@@ -1269,6 +1334,35 @@ if __name__ == "__main__":
         default=800,
         help="Maximum number of correspondences to use for TEASER++ (default: 800). Larger values may cause max-clique blowups."
     )
+    parser.add_argument(
+        "--auto-metricize",
+        action="store_true",
+        help="Apply affine mapping to convert non-metric depth to approximate meters (for depth_v3, etc.)"
+    )
+    parser.add_argument(
+        "--auto-metricize-p-low",
+        type=float,
+        default=5,
+        help="Lower percentile for auto-metricize mapping (default: 5)"
+    )
+    parser.add_argument(
+        "--auto-metricize-p-high",
+        type=float,
+        default=95,
+        help="Upper percentile for auto-metricize mapping (default: 95)"
+    )
+    parser.add_argument(
+        "--auto-metricize-z-low",
+        type=float,
+        default=None,
+        help="Target Z low value for auto-metricize (default: uses --crop-z-min)"
+    )
+    parser.add_argument(
+        "--auto-metricize-z-high",
+        type=float,
+        default=None,
+        help="Target Z high value for auto-metricize (default: uses --crop-z-max)"
+    )
     args = parser.parse_args()
     
     # Determine which methods to process
@@ -1344,7 +1438,12 @@ if __name__ == "__main__":
             rel_crop_min_pct=args.rel_crop_min_pct,
             rel_crop_max_pct=args.rel_crop_max_pct,
             rel_crop_invert=args.rel_crop_invert,
-            max_teaser_corr=args.max_teaser_corr
+            max_teaser_corr=args.max_teaser_corr,
+            auto_metricize=args.auto_metricize,
+            auto_metricize_p_low=args.auto_metricize_p_low,
+            auto_metricize_p_high=args.auto_metricize_p_high,
+            auto_metricize_z_low=args.auto_metricize_z_low,
+            auto_metricize_z_high=args.auto_metricize_z_high
         )
         total_processed += processed
     
