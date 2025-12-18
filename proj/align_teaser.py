@@ -64,7 +64,7 @@ def apply_sim3_to_pcd(pcd: o3d.geometry.PointCloud, s: float, R: np.ndarray, t: 
 
     return pcd_copy
 
-def multi_scale_icp(source, target, init_transformation, voxel_sizes=(0.05, 0.02, 0.01), max_iters=(50, 30, 14)):
+def multi_scale_icp(source, target, init_transformation, voxel_sizes=(0.5, 0.2, 0.1), max_iters=(50, 30, 14)):
     """
     Multi-scale ICP to refine the alignment.
     """
@@ -77,7 +77,7 @@ def multi_scale_icp(source, target, init_transformation, voxel_sizes=(0.05, 0.02
 
         result_icp = o3d.pipelines.registration.registration_icp(
             src_down, tgt_down,
-            max_correspondence_distance=vs * 1.5,
+            max_correspondence_distance=vs * 2.0,  # Increased from 1.5 to 2.0 for better convergence
             init=current_trans,
             estimation_method=o3d.pipelines.registration.TransformationEstimationPointToPlane(),
             criteria=o3d.pipelines.registration.ICPConvergenceCriteria(max_iteration=it),
@@ -120,28 +120,39 @@ def sim3_teaser_pipeline(pcd_cam, pcd_lidar, noise_bound, corr_src_pts, corr_dst
     if verbose:
         print(f"TEASER++ result: scale {s}, translation {t}, rotation:\n{R}")
 
-    # Apply sim(3)
+    # Build Sim(3) transformation matrix T_sim3
+    T_sim3 = np.eye(4)
+    T_sim3[:3, :3] = s * R
+    T_sim3[:3, 3] = t
+
+    # Apply sim(3) to get transformed cloud (for ICP input)
     cam_trans = apply_sim3_to_pcd(pcd_cam, s, R, t)
 
-    # Build initial 4x4 transformation
-    init_T = np.eye(4)
-    init_T[:3, :3] = s * R
-    init_T[:3, 3] = t
+    # ICP refine: start from identity since cam_trans is already transformed
+    # ICP will compute a rigid refinement T_icp on the already-transformed cloud
+    T_icp, icp_res = multi_scale_icp(cam_trans, pcd_lidar, np.eye(4))
 
-    # ICP refine
-    final_T, icp_res = multi_scale_icp(cam_trans, pcd_lidar, init_T)
+    # Compose transforms: T_total = T_icp @ T_sim3
+    # This applies Sim(3) first, then ICP's rigid refinement
+    T_total = T_icp @ T_sim3
 
-    fitness, rmse = evaluate(pcd_cam, pcd_lidar, final_T, max_dist=noise_bound * 1.5)
+    # Evaluate using the composed transform on original clouds
+    # Use larger max_dist for evaluation (0.5m or 2 * LIDAR_PCD_VOXEL_SIZE)
+    # LIDAR_PCD_VOXEL_SIZE is typically 0.2, so 2 * 0.2 = 0.4, use 0.5 for safety
+    eval_max_dist = 0.5
+    fitness, rmse = evaluate(pcd_cam, pcd_lidar, T_total, max_dist=eval_max_dist)
     if verbose:
         print(f"After ICP: fitness = {fitness:.4f}, RMSE = {rmse:.6f}")
 
-    cam_aligned = copy.deepcopy(pcd_cam).transform(final_T)
+    # Apply composed transform to original camera cloud
+    cam_aligned = copy.deepcopy(pcd_cam).transform(T_total)
     metadata = {
         "s": s,
         "R": R,
         "t": t,
-        "init_T": init_T,
-        "final_T": final_T,
+        "T_sim3": T_sim3,
+        "T_icp": T_icp,
+        "final_T": T_total,  # Keep for backward compatibility
         "icp_res": icp_res,
         "fitness": fitness,
         "rmse": rmse,

@@ -53,12 +53,17 @@ CAMERA_PCD_VOXEL_SIZES = {
     "marigold": 1e-3,
     "midas": 1e-3,
     "midas_small": 1e-3,
-    "depth_pro": 1e-3,
+    "depth_pro": 1e-3,  # Reverted to 1e-3 for initial downsampling
 }
 # Default fallback
 CAMERA_PCD_VOXEL_SIZE = 1e-3
 LIDAR_PCD_VOXEL_SIZE = 0.2 # 1.0 default
 MAX_POINTS_AFTER_DOWNSAMPLE = 5000  # Cap point count after downsampling for guaranteed runtime
+
+# Feature extraction voxel size for RANSAC-based correspondence matching
+# Use same size for both source and target clouds
+# Smaller than initial downsampling to preserve more features
+FEATURE_VOXEL_SIZE = 0.05  # 0.05m for feature matching (was 0.1m)
 
 # Depth range filtering parameters
 # For metric methods (depth_pro, depth_v3): use fixed range in meters
@@ -276,6 +281,86 @@ def extract_fpfh_features(pcd, voxel_size):
     return np.array(fpfh.data).T
 
 
+def find_correspondences_ransac_fpfh(pcd_src, pcd_tgt, voxel_size, mutual_filter=True):
+    """
+    Find correspondences using Open3D RANSAC-based global registration on FPFH features.
+    
+    Args:
+        pcd_src: Source point cloud (Open3D)
+        pcd_tgt: Target point cloud (Open3D)
+        voxel_size: Voxel size for downsampling and feature extraction (same for both)
+        mutual_filter: If True, use mutual filter in RANSAC
+    
+    Returns:
+        corr_src_pts: Corresponding source points (N, 3) from downsampled cloud
+        corr_tgt_pts: Corresponding target points (N, 3) from downsampled cloud
+        ransac_result: Open3D RANSAC registration result
+    """
+    # Downsample both clouds with the same voxel_size
+    pcd_src_down = pcd_src.voxel_down_sample(voxel_size)
+    pcd_tgt_down = pcd_tgt.voxel_down_sample(voxel_size)
+    
+    # Estimate normals
+    radius_normal = voxel_size * 2
+    pcd_src_down.estimate_normals(
+        o3d.geometry.KDTreeSearchParamHybrid(radius=radius_normal, max_nn=30))
+    pcd_tgt_down.estimate_normals(
+        o3d.geometry.KDTreeSearchParamHybrid(radius=radius_normal, max_nn=30))
+    
+    # Compute FPFH features
+    radius_feature = voxel_size * 5
+    fpfh_src = o3d.pipelines.registration.compute_fpfh_feature(
+        pcd_src_down,
+        o3d.geometry.KDTreeSearchParamHybrid(radius=radius_feature, max_nn=100))
+    fpfh_tgt = o3d.pipelines.registration.compute_fpfh_feature(
+        pcd_tgt_down,
+        o3d.geometry.KDTreeSearchParamHybrid(radius=radius_feature, max_nn=100))
+    
+    # RANSAC-based global registration
+    # Use larger max_correspondence_distance to be less aggressive with filtering
+    max_correspondence_distance = voxel_size * 2.0
+    
+    # Set up checkers - use less strict edge length checker to allow more correspondences
+    checkers = [
+        o3d.pipelines.registration.CorrespondenceCheckerBasedOnEdgeLength(0.8),  # Less strict (was 0.9)
+        o3d.pipelines.registration.CorrespondenceCheckerBasedOnDistance(max_correspondence_distance)
+    ]
+    
+    # RANSAC parameters
+    ransac_n = 3  # Minimum correspondences for a hypothesis
+    estimation_method = o3d.pipelines.registration.TransformationEstimationPointToPoint(False)
+    
+    # Run RANSAC with more iterations for better results
+    ransac_result = o3d.pipelines.registration.registration_ransac_based_on_feature_matching(
+        pcd_src_down, pcd_tgt_down,
+        fpfh_src, fpfh_tgt,
+        mutual_filter=mutual_filter,
+        max_correspondence_distance=max_correspondence_distance,
+        estimation_method=estimation_method,
+        ransac_n=ransac_n,
+        checkers=checkers,
+        criteria=o3d.pipelines.registration.RANSACConvergenceCriteria(4000000, 500)
+    )
+    
+    # Extract correspondences from RANSAC result
+    if ransac_result.correspondence_set is None or len(ransac_result.correspondence_set) == 0:
+        return np.array([]).reshape(0, 3), np.array([]).reshape(0, 3), ransac_result
+    
+    # Get correspondence indices
+    corres_indices = np.asarray(ransac_result.correspondence_set)
+    src_indices = corres_indices[:, 0]
+    tgt_indices = corres_indices[:, 1]
+    
+    # Extract corresponding points from downsampled clouds
+    src_pts = np.asarray(pcd_src_down.points)
+    tgt_pts = np.asarray(pcd_tgt_down.points)
+    
+    corr_src_pts = src_pts[src_indices]
+    corr_tgt_pts = tgt_pts[tgt_indices]
+    
+    return corr_src_pts, corr_tgt_pts, ransac_result
+
+
 def find_correspondences_fpfh(feats0, feats1, mutual_filter=True):
     """
     Find correspondences using FPFH features via nearest neighbor search.
@@ -456,30 +541,51 @@ def process_pair(idx, depth_dir, depth_method, meta_path, verbose=False, estimat
         return None
     
     if verbose:
-        print(f"  [{idx}] Extracting FPFH features for correspondence matching...")
+        print(f"  [{idx}] Running RANSAC-based FPFH correspondence matching...")
     
-    # Extract FPFH features for both point clouds
+    # Use RANSAC-based global registration for correspondences
     start_time = time.time()
-    cam_voxel_size = CAMERA_PCD_VOXEL_SIZES.get(depth_method, CAMERA_PCD_VOXEL_SIZE)
-    feats_cam = extract_fpfh_features(pcd_cam, cam_voxel_size)
-    feats_lidar = extract_fpfh_features(pcd_lidar, LIDAR_PCD_VOXEL_SIZE)
-    
-    # Find correspondences using FPFH features
-    corres_idx0, corres_idx1 = find_correspondences_fpfh(feats_cam, feats_lidar, mutual_filter=True)
-    n_corr = len(corres_idx0)
+    points_cam_corr, pts_lidar_corr, ransac_result = find_correspondences_ransac_fpfh(
+        pcd_cam, pcd_lidar, FEATURE_VOXEL_SIZE, mutual_filter=True
+    )
     feature_time = time.time() - start_time
     
+    n_corr = len(points_cam_corr)
+    
+    # TEMP VERIFICATION: Check coordinate frame consistency
+    if verbose and n_corr > 0:
+        # Check point cloud bounds to verify coordinate frames
+        cam_pts_array = np.asarray(pcd_cam.points)
+        lidar_pts_array = np.asarray(pcd_lidar.points)
+        print(f"  [{idx}] Coordinate frame check:")
+        print(f"    Camera cloud bounds: X[{cam_pts_array[:, 0].min():.2f}, {cam_pts_array[:, 0].max():.2f}], "
+              f"Y[{cam_pts_array[:, 1].min():.2f}, {cam_pts_array[:, 1].max():.2f}], "
+              f"Z[{cam_pts_array[:, 2].min():.2f}, {cam_pts_array[:, 2].max():.2f}]")
+        print(f"    LiDAR cloud bounds: X[{lidar_pts_array[:, 0].min():.2f}, {lidar_pts_array[:, 0].max():.2f}], "
+              f"Y[{lidar_pts_array[:, 1].min():.2f}, {lidar_pts_array[:, 1].max():.2f}], "
+              f"Z[{lidar_pts_array[:, 2].min():.2f}, {lidar_pts_array[:, 2].max():.2f}]")
+        print(f"    Correspondence points - Camera: {points_cam_corr.shape}, LiDAR: {pts_lidar_corr.shape}")
+        # Check if correspondence points are within original cloud bounds
+        if n_corr > 0:
+            corr_cam_in_bounds = np.all(
+                (points_cam_corr >= cam_pts_array.min(axis=0)) & 
+                (points_cam_corr <= cam_pts_array.max(axis=0))
+            )
+            corr_lidar_in_bounds = np.all(
+                (pts_lidar_corr >= lidar_pts_array.min(axis=0)) & 
+                (pts_lidar_corr <= lidar_pts_array.max(axis=0))
+            )
+            print(f"    Correspondence points within original bounds: cam={corr_cam_in_bounds}, lidar={corr_lidar_in_bounds}")
+    
     if verbose:
-        print(f"  [{idx}] FPFH feature extraction and matching: {feature_time:.3f}s")
-        print(f"  [{idx}] Found {n_corr} correspondences (mutual nearest neighbor)")
+        print(f"  [{idx}] RANSAC feature matching: {feature_time:.3f}s")
+        print(f"  [{idx}] Found {n_corr} correspondences from RANSAC")
+        if hasattr(ransac_result, 'fitness'):
+            print(f"  [{idx}] RANSAC fitness: {ransac_result.fitness:.4f}, inlier_rmse: {ransac_result.inlier_rmse:.6f}")
     
     if n_corr < 3:
-        print(f"  [{idx}] SKIP: too few correspondences (n={n_corr}, need >= 3)")
+        print(f"  [{idx}] SKIP: too few correspondences from RANSAC (n={n_corr}, need >= 3)")
         return None
-    
-    # Extract corresponding points
-    points_cam_corr = np.asarray(pcd_cam.points)[corres_idx0]
-    pts_lidar_corr = pts_lidar[corres_idx1]
     
     if verbose:
         print(f"  [{idx}] Running TEASER++ alignment with {n_corr} correspondences...")
@@ -497,26 +603,40 @@ def process_pair(idx, depth_dir, depth_method, meta_path, verbose=False, estimat
     )
     teaser_time = time.time() - teaser_start
     
-    # Calculate inlier ratio (points within noise_bound after transformation)
+    # Calculate inlier ratio (points within threshold after transformation)
     if 'final_T' in metadata:
-        # Transform camera correspondences using final transformation
-        T = metadata['final_T']
-        R = T[:3, :3]
-        t = T[:3, 3]
-        # Apply transformation: transformed = R @ points.T + t
-        points_cam_corr_transformed = (R @ points_cam_corr.T).T + t
+        # Transform camera correspondences using final composed transformation
+        T_total = metadata['final_T']
+        # Apply transformation: transformed = T_total @ [points; 1]
+        points_cam_corr_homogeneous = np.hstack([points_cam_corr, np.ones((len(points_cam_corr), 1))])
+        points_cam_corr_transformed = (T_total @ points_cam_corr_homogeneous.T).T[:, :3]
         # Compute distances between transformed camera points and LiDAR correspondences
         dists = np.linalg.norm(points_cam_corr_transformed - pts_lidar_corr, axis=1)
-        noise_bound = 0.05
-        inlier_ratio = np.sum(dists < noise_bound * 1.5) / len(dists) if len(dists) > 0 else 0.0
+        inlier_threshold = 0.3  # 0.3m threshold for inlier ratio
+        inlier_ratio = np.sum(dists < inlier_threshold) / len(dists) if len(dists) > 0 else 0.0
+        
+        # VERIFICATION: Debug inlier ratio calculation
+        if verbose and n_corr > 0:
+            print(f"  [{idx}] Inlier ratio verification:")
+            print(f"    Distance stats: min={dists.min():.4f}m, max={dists.max():.4f}m, mean={dists.mean():.4f}m, median={np.median(dists):.4f}m")
+            print(f"    Points within {inlier_threshold}m: {np.sum(dists < inlier_threshold)}/{n_corr}")
+            # Show sample of transformed vs target points
+            if n_corr >= 3:
+                print(f"    Sample (first 3 correspondences):")
+                for i in range(min(3, n_corr)):
+                    print(f"      [{i}] cam_transformed: {points_cam_corr_transformed[i]}, lidar: {pts_lidar_corr[i]}, dist: {dists[i]:.4f}m")
         metadata['correspondences_count'] = n_corr
         metadata['inlier_ratio'] = float(inlier_ratio)
         metadata['teaser_runtime'] = teaser_time
         metadata['feature_extraction_time'] = feature_time
+        if hasattr(ransac_result, 'fitness'):
+            metadata['ransac_fitness'] = float(ransac_result.fitness)
+            metadata['ransac_inlier_rmse'] = float(ransac_result.inlier_rmse)
         
         if verbose:
             print(f"  [{idx}] TEASER++ runtime: {teaser_time:.3f}s")
-            print(f"  [{idx}] Inlier ratio: {inlier_ratio:.4f} ({np.sum(dists < noise_bound * 1.5)}/{n_corr})")
+            n_inliers = np.sum(dists < inlier_threshold)
+            print(f"  [{idx}] Inlier ratio: {inlier_ratio:.4f} ({n_inliers}/{n_corr}) [threshold: {inlier_threshold:.2f}m]")
     else:
         metadata['correspondences_count'] = n_corr
         metadata['teaser_runtime'] = teaser_time
