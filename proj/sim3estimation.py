@@ -62,12 +62,15 @@ LIDAR_PCD_VOXEL_SIZE = 0.2 # 1.0 default
 # Point count management (for debugging alignment quality)
 # TARGET_MAX_POINTS: Active control - adaptive voxel sizing will iteratively increase voxel size
 #                    until point count <= this value. This is what we actively try to achieve.
-TARGET_MAX_POINTS = 15000
+TARGET_MAX_POINTS = 20000
 
 # MAX_POINTS_WARNING_THRESHOLD: Passive warning - if point count exceeds this AFTER adaptive sizing,
 #                               prints a warning but takes no action. Should be higher than TARGET.
 #                               Indicates the initial voxel size might be too small or data is very dense.
 MAX_POINTS_WARNING_THRESHOLD = 15001
+
+# Maximum camera voxel size cap to prevent destroying local geometry
+MAX_CAM_VOXEL = 0.30  # meters - maximum voxel size for adaptive downsampling
 
 # Initial voxel sizes for adaptive downsampling (per method)
 CAMERA_VOXEL_INITIAL = {
@@ -90,7 +93,11 @@ FEATURE_VOXEL_SIZE = 0.05  # 0.05m for feature matching
 # For metric methods (depth_pro, depth_v3): use fixed range in meters
 DEPTH_RANGE_METRIC = {
     "MIN_Z": 0.1,   # Minimum depth in meters (10cm)
-    "MAX_Z": 100.0, # Maximum depth in meters (100m)
+    "MAX_Z": 100.0, # Maximum depth in meters (100m) - can be overridden per method
+}
+# Per-method max depth overrides (for debugging)
+DEPTH_RANGE_METRIC_OVERRIDE = {
+    "depth_pro": 50.0,  # Limit depth_pro to 50m to match LiDAR forward range
 }
 # For relative methods: use percentile clipping
 DEPTH_RANGE_PERCENTILES = {
@@ -282,32 +289,25 @@ def apply_camera_crops(pcd_cam, crop_z_min, crop_z_max, crop_fov_scale, fx, fy, 
     return pcd_cam
 
 
-def backproject_depth(depth_img, voxel_size=None, method=None, verbose=False, target_max_points=None):
+def backproject_depth(depth_img, fx, fy, cx, cy, method=None, verbose=False):
     """
-    Backproject depth image to point cloud with adaptive voxel sizing.
+    Backproject depth image to point cloud (no voxel downsampling - returns full cloud after depth filtering).
     
     Args:
         depth_img: Preprocessed depth image (metric depth in meters)
-        voxel_size: Initial voxel size for downsampling (if None, uses method-specific default)
+        fx: Camera focal length in X
+        fy: Camera focal length in Y
+        cx: Camera principal point X
+        cy: Camera principal point Y
         method: Depth method name (for method-aware filtering)
         verbose: If True, print filtering statistics
-        target_max_points: Target maximum point count (if None, uses TARGET_MAX_POINTS)
     
     Returns:
-        pcd: Open3D point cloud
-        n_pre: Point count before downsampling
-        n_post: Point count after downsampling (after adaptive voxel sizing)
+        pcd: Open3D point cloud (after depth range filtering, no voxel downsampling)
+        n_before_filter: Point count before depth range filter
+        n_after_filter: Point count after depth range filter
         n_filtered: Number of points removed by depth range filter
-        final_voxel_size: Final voxel size used (after adaptive adjustment)
     """
-    if target_max_points is None:
-        target_max_points = TARGET_MAX_POINTS
-    
-    if voxel_size is None:
-        # Use method-specific initial voxel size
-        initial_voxel_size = CAMERA_VOXEL_INITIAL.get(method, CAMERA_PCD_VOXEL_SIZE)
-    else:
-        initial_voxel_size = voxel_size
     
     h, w = depth_img.shape
     u, v = np.meshgrid(np.arange(w), np.arange(h))
@@ -321,7 +321,7 @@ def backproject_depth(depth_img, voxel_size=None, method=None, verbose=False, ta
     if np.sum(valid) == 0:
         # Return empty point cloud
         pcd = o3d.geometry.PointCloud()
-        return pcd, 0, 0, 0, initial_voxel_size
+        return pcd, 0, 0, 0
     
     depth_valid = depth_flat[valid]
     u_valid = u_flat[valid]
@@ -344,9 +344,9 @@ def backproject_depth(depth_img, voxel_size=None, method=None, verbose=False, ta
 
     # Apply method-aware depth range filtering
     if method in ["depth_pro", "depth_v3"]:
-        # Metric methods: use fixed range in meters
+        # Metric methods: use fixed range in meters (with per-method override if available)
         MIN_Z = DEPTH_RANGE_METRIC["MIN_Z"]
-        MAX_Z = DEPTH_RANGE_METRIC["MAX_Z"]
+        MAX_Z = DEPTH_RANGE_METRIC_OVERRIDE.get(method, DEPTH_RANGE_METRIC["MAX_Z"])
         valid_pts = (Z > MIN_Z) & (Z < MAX_Z)
         if verbose:
             print(f"    Depth range filter (metric): {MIN_Z:.2f}m < Z < {MAX_Z:.2f}m")
@@ -371,16 +371,43 @@ def backproject_depth(depth_img, voxel_size=None, method=None, verbose=False, ta
 
     if len(pts) == 0:
         pcd = o3d.geometry.PointCloud()
-        return pcd, 0, 0, n_filtered, initial_voxel_size
+        return pcd, n_before_filter, 0, n_filtered
 
     # Keep points in standard camera coordinates (X right, Y down, Z forward)
     # Do not flip axes here - any frame transforms should be done explicitly and consistently
 
     pcd = o3d.geometry.PointCloud()
     pcd.points = o3d.utility.Vector3dVector(pts)
+    n_after_filter = len(pcd.points)
+    
+    if verbose:
+        print(f"    Points kept after depth filtering: {n_after_filter}")
+    
+    return pcd, n_before_filter, n_after_filter, n_filtered
 
-    # Adaptive voxel downsampling: iteratively increase voxel size if needed
+
+def adaptive_voxel_downsample(pcd, method=None, verbose=False):
+    """
+    Apply adaptive voxel downsampling to point cloud with max voxel cap.
+    
+    Args:
+        pcd: Open3D point cloud
+        method: Depth method name (for method-specific initial voxel size)
+        verbose: If True, print statistics
+    
+    Returns:
+        pcd_down: Downsampled point cloud
+        final_voxel_size: Final voxel size used
+        n_pre: Point count before downsampling
+        n_post: Point count after downsampling
+    """
+    if len(pcd.points) == 0:
+        return pcd, 0.0, 0, 0
+    
     n_pre = len(pcd.points)
+    
+    # Get initial voxel size
+    initial_voxel_size = CAMERA_VOXEL_INITIAL.get(method, CAMERA_PCD_VOXEL_SIZE)
     current_voxel_size = initial_voxel_size
     max_iterations = 10
     iteration = 0
@@ -389,30 +416,38 @@ def backproject_depth(depth_img, voxel_size=None, method=None, verbose=False, ta
         pcd_down = pcd.voxel_down_sample(voxel_size=current_voxel_size)
         n_post = len(pcd_down.points)
         
-        if n_post <= target_max_points:
+        if n_post <= TARGET_MAX_POINTS:
             # Target reached, use this voxel size
             pcd = pcd_down
             break
+        elif current_voxel_size >= MAX_CAM_VOXEL:
+            # Hit max voxel cap, stop increasing
+            pcd = pcd_down
+            if verbose:
+                print(f"    WARNING: Hit max voxel cap ({MAX_CAM_VOXEL:.3f}m) with {n_post} points (> {TARGET_MAX_POINTS})")
+            break
         else:
-            # Increase voxel size and try again
-            current_voxel_size *= 1.5
+            # Increase voxel size and try again (but don't exceed cap)
+            next_voxel_size = current_voxel_size * 1.5
+            if next_voxel_size > MAX_CAM_VOXEL:
+                current_voxel_size = MAX_CAM_VOXEL
+            else:
+                current_voxel_size = next_voxel_size
             iteration += 1
             if verbose:
-                print(f"    Voxel size {current_voxel_size/1.5:.6f}m -> {current_voxel_size:.6f}m (points: {n_post} > {target_max_points})")
+                print(f"    Voxel size {current_voxel_size/1.5:.6f}m -> {current_voxel_size:.6f}m (points: {n_post} > {TARGET_MAX_POINTS})")
     
     final_voxel_size = current_voxel_size
     n_post = len(pcd.points)
     
     # Warn if still over threshold (but don't cap)
     if n_post > MAX_POINTS_WARNING_THRESHOLD:
-        print(f"    WARNING: camera cloud has {n_post} points (> {MAX_POINTS_WARNING_THRESHOLD}); consider increasing initial voxel size")
+        print(f"    WARNING: camera cloud has {n_post} points (> {MAX_POINTS_WARNING_THRESHOLD}) after adaptive voxel sizing")
     
     if verbose:
-        print(f"    Points kept after depth filtering: {len(pts)}")
-        print(f"    Final voxel size used: {final_voxel_size:.6f}m")
-        print(f"    Final point count after adaptive downsampling: {n_post}")
+        print(f"    Adaptive voxel downsampling: {n_pre} -> {n_post} points (voxel: {final_voxel_size:.6f}m)")
     
-    return pcd, n_pre, n_post, n_filtered, final_voxel_size
+    return pcd, final_voxel_size, n_pre, n_post
 
 
 def extract_fpfh_features(pcd, voxel_size):
@@ -580,7 +615,7 @@ def find_correspondences_fpfh(feats0, feats1, mutual_filter=True):
 
 
 def process_pair(idx, depth_dir, depth_method, meta_path, verbose=False, estimate_scaling=True, depth_mode="auto", is_first_frame=False,
-                 crop_z_min=2.0, crop_z_max=50.0, crop_fov_scale=0.6, viz=False, viz_after=False, viz_frame_idx=0):
+                 crop_z_min=2.0, crop_z_max=50.0, crop_fov_scale=0.8, viz=False, viz_after=False, viz_frame_idx=0, k_scale=2.0):
     """
     Process a single depth-LiDAR pair.
     
@@ -638,26 +673,64 @@ def process_pair(idx, depth_dir, depth_method, meta_path, verbose=False, estimat
     if verbose:
         print(f"  [{idx}] Depth shape: {depth_processed.shape}, backprojecting to point cloud...")
     
-    # Backproject with adaptive voxel sizing
-    pcd_cam, n_cam_pre, n_cam_post, n_filtered, final_voxel_size = backproject_depth(
-        depth_processed, 
-        voxel_size=None,  # Will use method-specific initial size
+    # Compute scaled intrinsics
+    # Note: k_scale is passed as parameter to process_pair
+    fx_eff = fx * k_scale
+    fy_eff = fy * k_scale
+    cx_eff = cx * k_scale
+    cy_eff = cy * k_scale
+    
+    # Log effective intrinsics in test/verbose mode
+    if is_first_frame or verbose:
+        print(f"  [{idx}] Camera intrinsics:")
+        print(f"    Original: fx={fx:.2f}, fy={fy:.2f}, cx={cx:.2f}, cy={cy:.2f}")
+        print(f"    Scaled (k_scale={k_scale:.2f}): fx={fx_eff:.2f}, fy={fy_eff:.2f}, cx={cx_eff:.2f}, cy={cy_eff:.2f}")
+    
+    # Backproject depth (no voxel downsampling yet - returns full cloud after depth filtering)
+    pcd_cam_full, n_cam_before_filter, n_cam_after_filter, n_filtered = backproject_depth(
+        depth_processed,
+        fx_eff, fy_eff, cx_eff, cy_eff,
         method=depth_method,
         verbose=is_first_frame
     )
     
-    if len(pcd_cam.points) == 0:
+    if len(pcd_cam_full.points) == 0:
         print(f"  [{idx}] SKIP: Empty point cloud after backprojection")
         return None
     
-    # Apply principled camera crops (Z range + optional FOV)
-    n_cam_pre_crop = len(pcd_cam.points)
-    pcd_cam = apply_camera_crops(pcd_cam, crop_z_min, crop_z_max, crop_fov_scale, fx, fy, verbose=verbose or is_first_frame)
-    n_cam_post_crop = len(pcd_cam.points)
+    # Visualization: raw clouds before any modifications
+    should_viz_raw = viz and (is_first_frame or (not is_first_frame and idx == f"{viz_frame_idx:05d}"))
+    if should_viz_raw:
+        # Store raw camera cloud before cropping
+        pcd_cam_raw = copy.deepcopy(pcd_cam_full)
+    
+    # Apply principled camera crops (Z range + optional FOV) using scaled intrinsics
+    # Crop BEFORE adaptive voxel sizing to avoid absurd voxel sizes from far points
+    n_cam_pre_crop = len(pcd_cam_full.points)
+    pcd_cam_crop = apply_camera_crops(pcd_cam_full, crop_z_min, crop_z_max, crop_fov_scale, fx_eff, fy_eff, verbose=verbose or is_first_frame)
+    n_cam_post_crop = len(pcd_cam_crop.points)
+    
+    if n_cam_post_crop < 100:
+        print(f"  [{idx}] SKIP: too few camera points after cropping (cam={n_cam_post_crop})")
+        return None
+    
+    # Apply adaptive voxel downsampling on CROPPED cloud only
+    pcd_cam, final_voxel_size, n_cam_pre_voxel, n_cam_post_voxel = adaptive_voxel_downsample(
+        pcd_cam_crop, method=depth_method, verbose=verbose or is_first_frame
+    )
+    
+    # Log point counts at each stage
+    if verbose or is_first_frame:
+        print(f"  [{idx}] Camera point cloud stages:")
+        print(f"    Full backprojection: {n_cam_before_filter} points")
+        print(f"    After depth filter: {n_cam_after_filter} points (removed {n_filtered})")
+        print(f"    After crop: {n_cam_post_crop} points")
+        print(f"    After adaptive voxel ({final_voxel_size:.6f}m): {n_cam_post_voxel} points")
     
     n_cam = len(pcd_cam.points)
+    
     if n_cam < 100:
-        print(f"  [{idx}] SKIP: too few camera points after cropping (cam={n_cam})")
+        print(f"  [{idx}] SKIP: too few camera points after adaptive voxel (cam={n_cam})")
         return None
 
     pcd_lidar = o3d.io.read_point_cloud(str(lidar_path))
@@ -665,6 +738,20 @@ def process_pair(idx, depth_dir, depth_method, meta_path, verbose=False, estimat
     n_lidar_pre = len(pcd_lidar.points)
     if verbose:
         print(f"  [{idx}] LiDAR PCD: {n_lidar_pre} points, processing axes...")
+    
+    # Visualization: raw clouds before any modifications
+    if should_viz_raw:
+        # Store raw LiDAR cloud before axis remapping and downsampling
+        pcd_lidar_raw_viz = copy.deepcopy(pcd_lidar)
+        try:
+            pcd_cam_raw_viz = copy.deepcopy(pcd_cam_raw)
+            pcd_cam_raw_viz.paint_uniform_color([1.0, 0.0, 0.0])  # Red for raw camera
+            pcd_lidar_raw_viz.paint_uniform_color([0.0, 1.0, 0.0])  # Green for raw LiDAR
+            print(f"  [{idx}] Visualizing RAW clouds (before any modifications) (camera=red, LiDAR=green)...")
+            o3d.visualization.draw_geometries([pcd_cam_raw_viz, pcd_lidar_raw_viz],
+                                             window_name=f"Raw clouds (pre-processing) [{idx}]")
+        except Exception as e:
+            print(f"  [{idx}] WARNING: Raw visualization failed (headless mode?): {e}")
 
     # [CHECK THE AXIS MANUALLY] post-process to get x-y-z axis
     pts_lidar_raw = np.asarray(pcd_lidar.points)[:, [1, 2, 0]] # Remap axes: (y, z, x) --> (x, y, z)
@@ -757,7 +844,7 @@ def process_pair(idx, depth_dir, depth_method, meta_path, verbose=False, estimat
     
     # Consolidated debug print per frame
     print(f"  [{idx}] === Frame Summary ===")
-    print(f"    Camera: voxel={final_voxel_size:.6f}m, crop=Z[{crop_z_min:.1f},{crop_z_max:.1f}]m FOV[{crop_fov_scale:.2f}], points={n_cam_pre_crop}->{n_cam_post_crop}")
+    print(f"    Camera: crop=Z[{crop_z_min:.1f},{crop_z_max:.1f}]m FOV[{crop_fov_scale:.2f}], voxel={final_voxel_size:.6f}m, points={n_cam_post_crop}->{n_cam_post_voxel}")
     print(f"    LiDAR: points={n_lidar_post_crop}")
     print(f"    RANSAC: {feature_time:.3f}s, {n_corr} correspondences", end="")
     if hasattr(ransac_result, 'fitness'):
@@ -857,7 +944,7 @@ def process_pair(idx, depth_dir, depth_method, meta_path, verbose=False, estimat
 
 
 def process_depth_method(depth_method, depth_dir, limit=None, test_mode=False, estimate_scaling=True, depth_mode_dict=None,
-                         crop_z_min=2.0, crop_z_max=50.0, crop_fov_scale=0.6, viz=False, viz_after=False, viz_frame_idx=0):
+                         crop_z_min=2.0, crop_z_max=50.0, crop_fov_scale=0.8, viz=False, viz_after=False, viz_frame_idx=0, k_scale=2.0):
     """
     Process all files for a given depth method.
     
@@ -922,7 +1009,8 @@ def process_depth_method(depth_method, depth_dir, limit=None, test_mode=False, e
             crop_fov_scale=crop_fov_scale,
             viz=should_viz_frame,
             viz_after=viz_after if should_viz_frame else False,
-            viz_frame_idx=viz_frame_idx
+            viz_frame_idx=viz_frame_idx,
+            k_scale=k_scale
         )
         if result:
             processed += 1
@@ -979,8 +1067,8 @@ if __name__ == "__main__":
     parser.add_argument(
         "--crop-fov-scale",
         type=float,
-        default=0.6,
-        help="FOV crop scale factor: keep central fraction of image FOV (0.6 = 60%%, 1.0 = no FOV crop, default: 0.6)"
+        default=0.8,
+        help="FOV crop scale factor: keep central fraction of image FOV (0.8 = 80%%, 1.0 = no FOV crop, default: 0.8)"
     )
     parser.add_argument(
         "--viz",
@@ -997,6 +1085,12 @@ if __name__ == "__main__":
         type=int,
         default=0,
         help="Frame index to visualize (0 = first processed frame, default: 0)"
+    )
+    parser.add_argument(
+        "--k-scale",
+        type=float,
+        default=2.0,
+        help="Scale factor for camera intrinsics (fx, fy, cx, cy). Default: 2.0 (for 2x resolution depth maps)"
     )
     args = parser.parse_args()
     
@@ -1044,10 +1138,14 @@ if __name__ == "__main__":
     estimate_scaling = not args.no_scale
     
     # Print crop settings if provided
-    if args.crop_z_min != 2.0 or args.crop_z_max != 50.0 or args.crop_fov_scale != 0.6:
+    if args.crop_z_min != 2.0 or args.crop_z_max != 50.0 or args.crop_fov_scale != 0.8:
         print(f"CROP SETTINGS: Z[{args.crop_z_min:.1f}, {args.crop_z_max:.1f}]m, FOV scale={args.crop_fov_scale:.2f}")
     if args.viz:
         print(f"VISUALIZATION: Enabled (frame_idx={args.viz_frame_idx}, after={args.viz_after})")
+    if args.k_scale != 2.0:
+        print(f"INTRINSICS SCALING: k_scale={args.k_scale:.2f} (default: 2.0)")
+    else:
+        print(f"INTRINSICS SCALING: k_scale={args.k_scale:.2f} (default)")
     
     total_processed = 0
     for method in methods_to_process:
@@ -1064,7 +1162,8 @@ if __name__ == "__main__":
             crop_fov_scale=args.crop_fov_scale,
             viz=args.viz,
             viz_after=args.viz_after,
-            viz_frame_idx=args.viz_frame_idx
+            viz_frame_idx=args.viz_frame_idx,
+            k_scale=args.k_scale
         )
         total_processed += processed
     
