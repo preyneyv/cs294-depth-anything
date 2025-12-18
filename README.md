@@ -38,6 +38,37 @@ python depth_generation_all.py --depth_pro
 ```
 ---
 
+### Evaluation
+
+···
+from evaluator import quick_evaluate, DepthMethodEvaluator
+import numpy as np
+from pathlib import Path
+K = np.array([
+    [491.331107883326, 0.0, 515.3434363622374],
+    [0.0, 492.14998153326013, 388.93983736974667],
+    [0.0, 0.0, 1.0]
+])
+
+DATA_ROOT = Path("../dataset")
+DEPTH_DIR = DATA_ROOT / "depth"
+LIDAR_DIR = DATA_ROOT / "lidar"
+METADATA_PATH = DATA_ROOT / "aligned/metadata.jsonl"
+evaluator = DepthMethodEvaluator(K, str(LIDAR_DIR), inverse_depth=True)
+# this is for visualization
+evaluator.evaluate_method_debug(
+    'depth_anything_v3',
+    str(DATA_ROOT / "depth"),
+    str(METADATA_PATH),
+    depth_scale=175.0,
+    
+)
+# this is for getting table results
+quick_evaluate({
+    'depth_anything_v2': ('../dataset/depth_depth_anything_v3', '../dataset/aligned/metadata.jsonl'),
+}, lidar_dir='../dataset/lidar', K=K, depth_scale=175., auto_calibrate=False, inverse_depth=False)
+```
+
 ## 🚀 BUGS
 In the `sim3estimation.py`, there are several comments about WRONG implementations such as the wrong reverse process and the integer depth. NOT FIXED YET.
 - Bug1: The two extreme points 0 and 255 are reversed. But the current code simply use `255-PixelValue` to reverse it back which is not corresponding to the Relative-version DepthAnythingV2. NOT FIXED YET.
