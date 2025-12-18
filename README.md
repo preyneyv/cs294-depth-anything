@@ -40,7 +40,7 @@ python depth_generation_all.py --depth_pro
 
 ### Evaluation
 
-···
+```
 from evaluator import quick_evaluate, DepthMethodEvaluator
 import numpy as np
 from pathlib import Path
