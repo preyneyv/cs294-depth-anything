@@ -26,7 +26,8 @@ OUTPUT_DIR.mkdir(exist_ok=True)
 
 # All available depth directories
 DEPTH_DIRS = {
-    "depth": DATA_ROOT / "depth",
+    "depth": DATA_ROOT / "depth",  # Depth Anything V2 (backward compatible)
+    "depth_v3": DATA_ROOT / "depth_depth_anything_v3",  # Depth Anything V3
     "marigold": DATA_ROOT / "depth_marigold",
     "midas": DATA_ROOT / "depth_midas",
     "midas_small": DATA_ROOT / "depth_midas_small",
@@ -43,33 +44,183 @@ fx, fy = K[0, 0], K[1, 1]
 cx, cy = K[0, 2], K[1, 2]
 
 # Point cloud downsampling parameters 
-# CAMERA_PCD_VOXEL_SIZE = 1e-4 # earlier default setting
-# CAMERA_PCD_VOXEL_SIZE = 0.2 # for regular eval
-CAMERA_PCD_VOXEL_SIZE = 1e-3 # for fast test
-LIDAR_PCD_VOXEL_SIZE = 0.5 # 1.0 default
+# Per-method camera voxel sizes (adjust based on depth quality)
+CAMERA_PCD_VOXEL_SIZES = {
+    "depth": 1e-3,
+    "depth_v3": 1e-3,
+    "marigold": 1e-3,
+    "midas": 1e-3,
+    "midas_small": 1e-3,
+    "depth_pro": 1e-3,
+}
+# Default fallback
+CAMERA_PCD_VOXEL_SIZE = 1e-3
+LIDAR_PCD_VOXEL_SIZE = 0.2 # 1.0 default
 MAX_POINTS_AFTER_DOWNSAMPLE = 5000  # Cap point count after downsampling for guaranteed runtime
 
+# Depth range filtering parameters
+# For metric methods (depth_pro, depth_v3): use fixed range in meters
+DEPTH_RANGE_METRIC = {
+    "MIN_Z": 0.1,   # Minimum depth in meters (10cm)
+    "MAX_Z": 100.0, # Maximum depth in meters (100m)
+}
+# For relative methods: use percentile clipping
+DEPTH_RANGE_PERCENTILES = {
+    "MIN_PERCENTILE": 1.0,  # 1st percentile
+    "MAX_PERCENTILE": 95.0, # 95th percentile
+}
 
 
-def backproject_depth(depth_img):
+
+def preprocess_depth(depth: np.ndarray, method: str, depth_mode: str = "auto") -> np.ndarray:
+    """
+    Preprocess depth map based on method and mode.
+    
+    Args:
+        depth: Raw depth array (H, W)
+        method: Depth method name (e.g., "depth", "depth_pro", "marigold")
+        depth_mode: Processing mode - "auto", "raw", "inv", "one_minus_inv"
+    
+    Returns:
+        Preprocessed depth array (metric depth in meters, ready for backprojection)
+    """
+    depth = depth.astype(np.float32).copy()
+    
+    # Mask invalid values first
+    valid_mask = np.isfinite(depth) & (depth > 0)
+    
+    # Method-specific masking
+    if method == "depth_pro":
+        # Depth Pro has saturation cap at 10000
+        valid_mask = valid_mask & (depth < 9999)
+    elif method == "marigold":
+        # Marigold should be in [0, 1] if normalized
+        if depth_mode == "auto" or depth_mode == "one_minus_inv":
+            # Check if values are in [0, 1] range
+            if depth.max() <= 1.0 and depth.min() >= 0:
+                valid_mask = valid_mask & (depth >= 0) & (depth <= 1.0)
+            else:
+                # Fall back to treating as inverse depth
+                if depth_mode == "auto":
+                    depth_mode = "inv"
+    
+    # Apply valid mask
+    depth[~valid_mask] = np.nan
+    
+    # Determine processing mode
+    if depth_mode == "auto":
+        # Per-method defaults
+        if method in ["depth", "depth_v3", "midas", "midas_small"]:
+            depth_mode = "inv"  # Inverse depth-like
+        elif method == "depth_pro":
+            depth_mode = "raw"  # Direct metric depth
+        elif method == "marigold":
+            # Check if normalized [0,1]
+            if np.nanmax(depth) <= 1.0 and np.nanmin(depth) >= 0:
+                depth_mode = "one_minus_inv"  # Normalized inverse depth visualization
+            else:
+                depth_mode = "inv"  # Fallback to inverse depth
+        else:
+            depth_mode = "inv"  # Default fallback
+    
+    # Apply preprocessing
+    if depth_mode == "raw":
+        # Use depth directly (already metric)
+        z = depth.copy()
+    elif depth_mode == "inv":
+        # Inverse depth: z = 1 / depth
+        z = np.zeros_like(depth)
+        valid = np.isfinite(depth) & (depth > 1e-6)
+        z[valid] = 1.0 / depth[valid]
+        z[~valid] = np.nan
+    elif depth_mode == "one_minus_inv":
+        # For normalized inverse depth: z = 1 / (1 - depth)
+        # This handles visualization outputs where larger values = closer
+        z = np.zeros_like(depth)
+        valid = np.isfinite(depth) & (depth >= 0) & (depth < 1.0)
+        z[valid] = 1.0 / (1.0 - depth[valid] + 1e-6)  # Add small epsilon to avoid division by zero
+        z[~valid] = np.nan
+    else:
+        raise ValueError(f"Unknown depth_mode: {depth_mode}")
+    
+    return z
+
+
+def backproject_depth(depth_img, voxel_size=None, method=None, verbose=False):
+    """
+    Backproject depth image to point cloud.
+    
+    Args:
+        depth_img: Preprocessed depth image (metric depth in meters)
+        voxel_size: Voxel size for downsampling (if None, uses default)
+        method: Depth method name (for method-aware filtering)
+        verbose: If True, print filtering statistics
+    
+    Returns:
+        pcd: Open3D point cloud
+        n_pre: Point count before downsampling
+        n_post: Point count after downsampling
+        n_filtered: Number of points removed by depth range filter
+    """
+    if voxel_size is None:
+        voxel_size = CAMERA_PCD_VOXEL_SIZE
+    
     h, w = depth_img.shape
     u, v = np.meshgrid(np.arange(w), np.arange(h))
     depth_flat = depth_img.flatten().astype(np.float32)
     u_flat = u.flatten()
     v_flat = v.flatten()
 
-    depth_flat = np.clip(depth_flat, 1e-6, None) # prevent division by zero errors
-    depth_flat = 1.0 / depth_flat
+    # Mask invalid values (NaN, inf, non-positive)
+    valid = np.isfinite(depth_flat) & (depth_flat > 1e-6)
+    
+    if np.sum(valid) == 0:
+        # Return empty point cloud
+        pcd = o3d.geometry.PointCloud()
+        return pcd, 0, 0, 0
+    
+    depth_valid = depth_flat[valid]
+    u_valid = u_flat[valid]
+    v_valid = v_flat[valid]
 
-    X = (u_flat - cx) * depth_flat / fx
-    Y = (v_flat - cy) * depth_flat / fy
-    Z = depth_flat
+    # Backproject to 3D
+    X = (u_valid - cx) * depth_valid / fx
+    Y = (v_valid - cy) * depth_valid / fy
+    Z = depth_valid
 
     pts = np.vstack((X, Y, Z)).T
+    n_before_filter = len(pts)
 
-    # Remove sky points. 0.5's setting is important
-    valid = depth_flat < 0.5
-    pts = pts[valid]
+    # Apply method-aware depth range filtering
+    if method in ["depth_pro", "depth_v3"]:
+        # Metric methods: use fixed range in meters
+        MIN_Z = DEPTH_RANGE_METRIC["MIN_Z"]
+        MAX_Z = DEPTH_RANGE_METRIC["MAX_Z"]
+        valid_pts = (Z > MIN_Z) & (Z < MAX_Z)
+        if verbose:
+            print(f"    Depth range filter (metric): {MIN_Z:.2f}m < Z < {MAX_Z:.2f}m")
+    else:
+        # Relative methods: use percentile clipping
+        MIN_PERCENTILE = DEPTH_RANGE_PERCENTILES["MIN_PERCENTILE"]
+        MAX_PERCENTILE = DEPTH_RANGE_PERCENTILES["MAX_PERCENTILE"]
+        MIN_Z = np.percentile(Z, MIN_PERCENTILE)
+        MAX_Z = np.percentile(Z, MAX_PERCENTILE)
+        valid_pts = (Z > MIN_Z) & (Z < MAX_Z)
+        if verbose:
+            print(f"    Depth range filter (percentile): {MIN_PERCENTILE}th-{MAX_PERCENTILE}th percentile")
+            print(f"    Effective range: {MIN_Z:.6f}m < Z < {MAX_Z:.6f}m")
+    
+    pts = pts[valid_pts]
+    n_filtered = n_before_filter - len(pts)
+    
+    if verbose:
+        print(f"    Points before depth filter: {n_before_filter}")
+        print(f"    Points removed by depth filter: {n_filtered}")
+        print(f"    Points after depth filter: {len(pts)}")
+
+    if len(pts) == 0:
+        pcd = o3d.geometry.PointCloud()
+        return pcd, 0, 0, n_filtered
 
     # [CHECK THIS MANUALLY]
     # post-process to get x-y-z axis in the same direction with LiDAR pcd
@@ -78,12 +229,16 @@ def backproject_depth(depth_img):
     mask = (pts[:, 0] > -0.01) & (pts[:, 0] < 0.01)
     pts = pts[mask]
 
+    if len(pts) == 0:
+        pcd = o3d.geometry.PointCloud()
+        return pcd, 0, 0
+
     pcd = o3d.geometry.PointCloud()
     pcd.points = o3d.utility.Vector3dVector(pts)
 
     # Downsample to reduce point count for faster processing
     n_pre = len(pcd.points)
-    pcd = pcd.voxel_down_sample(voxel_size=CAMERA_PCD_VOXEL_SIZE)
+    pcd = pcd.voxel_down_sample(voxel_size=voxel_size)
     n_post = len(pcd.points)
     
     # Cap point count for guaranteed runtime
@@ -93,10 +248,10 @@ def backproject_depth(depth_img):
         pcd = pcd.select_by_index(indices)
         n_post = MAX_POINTS_AFTER_DOWNSAMPLE
 
-    return pcd, n_pre, n_post
+    return pcd, n_pre, n_post, n_filtered
 
 
-def process_pair(idx, depth_dir, depth_method, meta_path, verbose=False, estimate_scaling=True):
+def process_pair(idx, depth_dir, depth_method, meta_path, verbose=False, estimate_scaling=True, depth_mode="auto", is_first_frame=False):
     """
     Process a single depth-LiDAR pair.
     
@@ -106,6 +261,8 @@ def process_pair(idx, depth_dir, depth_method, meta_path, verbose=False, estimat
         depth_method: Name of depth method (e.g., "marigold")
         meta_path: Path to metadata file
         verbose: If True, print detailed progress
+        depth_mode: Depth preprocessing mode ("auto", "raw", "inv", "one_minus_inv")
+        is_first_frame: If True, print detailed statistics (for test mode)
     """
     if verbose:
         print(f"  [{idx}] Loading depth and LiDAR files...")
@@ -117,15 +274,60 @@ def process_pair(idx, depth_dir, depth_method, meta_path, verbose=False, estimat
         print(f"[SKIP] Missing pair for index {idx} (method: {depth_method})")
         return None
 
-    depth = np.load(depth_path)
-    if verbose:
-        print(f"  [{idx}] Depth shape: {depth.shape}, backprojecting to point cloud...")
+    # Load raw depth
+    depth_raw = np.load(depth_path)
     
-    pcd_cam, n_cam_pre, n_cam_post = backproject_depth(depth)
+    # Print raw statistics for first frame in test mode
+    if is_first_frame:
+        print(f"\n  [{idx}] Raw depth statistics:")
+        print(f"    Shape: {depth_raw.shape}, Dtype: {depth_raw.dtype}")
+        print(f"    Min:   {depth_raw.min():.6f}")
+        print(f"    Max:   {depth_raw.max():.6f}")
+        print(f"    Mean:  {depth_raw.mean():.6f}")
+        percentiles = np.percentile(depth_raw, [1, 5, 95, 99])
+        print(f"    Percentiles [1, 5, 95, 99]: {percentiles}")
+    
+    # Preprocess depth based on method
+    depth_processed = preprocess_depth(depth_raw, depth_method, depth_mode)
+    
+    # Print post-preprocess statistics for first frame
+    if is_first_frame:
+        valid_processed = np.isfinite(depth_processed) & (depth_processed > 0)
+        n_valid = np.sum(valid_processed)
+        print(f"  [{idx}] Post-preprocess statistics:")
+        if n_valid > 0:
+            depth_valid = depth_processed[valid_processed]
+            print(f"    Valid pixels: {n_valid} / {depth_processed.size}")
+            print(f"    Min:   {depth_valid.min():.6f}")
+            print(f"    Max:   {depth_valid.max():.6f}")
+            print(f"    Mean:  {depth_valid.mean():.6f}")
+        else:
+            print(f"    WARNING: No valid pixels after preprocessing!")
+    
+    if verbose:
+        print(f"  [{idx}] Depth shape: {depth_processed.shape}, backprojecting to point cloud...")
+    
+    # Get method-specific voxel size
+    voxel_size = CAMERA_PCD_VOXEL_SIZES.get(depth_method, CAMERA_PCD_VOXEL_SIZE)
+    
+    # Backproject with method-aware filtering
+    pcd_cam, n_cam_pre, n_cam_post, n_filtered = backproject_depth(
+        depth_processed, 
+        voxel_size=voxel_size,
+        method=depth_method,
+        verbose=is_first_frame
+    )
+    
+    if len(pcd_cam.points) == 0:
+        print(f"  [{idx}] SKIP: Empty point cloud after backprojection")
+        return None
+    
     points_cam = np.asarray(pcd_cam.points).copy()
     
     print(f"  [{idx}] cam points pre-voxel: {n_cam_pre}")
     print(f"  [{idx}] cam points post-voxel: {n_cam_post}")
+    if is_first_frame and n_filtered > 0:
+        print(f"  [{idx}] cam points removed by depth filter: {n_filtered}")
     
     n_cam = len(pcd_cam.points)
     if n_cam < 100:
@@ -205,7 +407,7 @@ def process_pair(idx, depth_dir, depth_method, meta_path, verbose=False, estimat
     return save_path
 
 
-def process_depth_method(depth_method, depth_dir, limit=None, test_mode=False, estimate_scaling=True):
+def process_depth_method(depth_method, depth_dir, limit=None, test_mode=False, estimate_scaling=True, depth_mode="auto"):
     """
     Process all files for a given depth method.
     
@@ -214,6 +416,7 @@ def process_depth_method(depth_method, depth_dir, limit=None, test_mode=False, e
         depth_dir: Path to depth directory
         limit: Optional limit on number of files to process (for testing)
         test_mode: If True, only process first 3 files
+        depth_mode: Depth preprocessing mode ("auto", "raw", "inv", "one_minus_inv")
     """
     print(f"\n{'='*60}")
     print(f"Processing depth method: {depth_method}")
@@ -246,8 +449,15 @@ def process_depth_method(depth_method, depth_dir, limit=None, test_mode=False, e
         pass  # Clear/create file
     
     processed = 0
-    for idx in tqdm(all_indices, desc=f"Aligning {depth_method}", ncols=100, disable=test_mode):
-        result = process_pair(idx, depth_dir, depth_method, meta_path, verbose=test_mode, estimate_scaling=estimate_scaling)
+    for i, idx in enumerate(tqdm(all_indices, desc=f"Aligning {depth_method}", ncols=100, disable=test_mode)):
+        is_first = (i == 0) and test_mode
+        result = process_pair(
+            idx, depth_dir, depth_method, meta_path, 
+            verbose=test_mode, 
+            estimate_scaling=estimate_scaling,
+            depth_mode=depth_mode,
+            is_first_frame=is_first
+        )
         if result:
             processed += 1
     
@@ -264,7 +474,7 @@ if __name__ == "__main__":
         nargs="+",
         choices=list(DEPTH_DIRS.keys()) + ["all"],
         default=["all"],
-        help="Depth methods to process (default: all). Options: depth, marigold, midas, midas_small, depth_pro, all"
+        help="Depth methods to process (default: all). Options: depth, depth_v3, marigold, midas, midas_small, depth_pro, all"
     )
     parser.add_argument(
         "--limit",
@@ -282,6 +492,13 @@ if __name__ == "__main__":
         action="store_true",
         help="Disable scale estimation in TEASER++ (faster, more stable for debugging)"
     )
+    parser.add_argument(
+        "--depth-mode",
+        type=str,
+        choices=["auto", "raw", "inv", "one_minus_inv"],
+        default="auto",
+        help="Depth preprocessing mode: auto (method-specific), raw (direct metric), inv (1/depth), one_minus_inv (1/(1-depth))"
+    )
     args = parser.parse_args()
     
     # Determine which methods to process
@@ -297,6 +514,8 @@ if __name__ == "__main__":
         print(f"LIMIT MODE: Processing only first {args.limit} files per method")
     if args.no_scale:
         print("SCALE ESTIMATION: DISABLED (faster, more stable)")
+    if args.depth_mode != "auto":
+        print(f"DEPTH MODE: {args.depth_mode} (overriding method defaults)")
     
     estimate_scaling = not args.no_scale
     
@@ -308,7 +527,8 @@ if __name__ == "__main__":
             depth_dir, 
             limit=args.limit,
             test_mode=args.test,
-            estimate_scaling=estimate_scaling
+            estimate_scaling=estimate_scaling,
+            depth_mode=args.depth_mode
         )
         total_processed += processed
     
