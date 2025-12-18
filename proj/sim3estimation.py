@@ -47,13 +47,14 @@ cx, cy = K[0, 2], K[1, 2]
 
 # Point cloud downsampling parameters 
 # Per-method camera voxel sizes (adjust based on depth quality)
+# Initial voxel sizes for adaptive downsampling (per method) - single source of truth
 CAMERA_PCD_VOXEL_SIZES = {
-    "depth": 1e-3,
-    "depth_v3": 1e-3,
-    "marigold": 1e-3,
-    "midas": 1e-3,
-    "midas_small": 1e-3,
-    "depth_pro": 1e-3,  # Reverted to 1e-3 for initial downsampling
+    "depth": 0.05,      # Dense relative method
+    "depth_v3": 0.05,   # Dense relative method (or metric if raw mode)
+    "marigold": 0.05,   # Dense relative method
+    "midas": 0.05,      # Dense relative method
+    "midas_small": 0.05, # Dense relative method
+    "depth_pro": 0.05,  # Metric method - keep at 1e-3 to preserve behavior
 }
 # Default fallback
 CAMERA_PCD_VOXEL_SIZE = 1e-3
@@ -72,15 +73,8 @@ MAX_POINTS_WARNING_THRESHOLD = int(TARGET_MAX_POINTS * 1.25)
 # Maximum camera voxel size cap to prevent destroying local geometry
 MAX_CAM_VOXEL = 0.30  # meters - maximum voxel size for adaptive downsampling
 
-# Initial voxel sizes for adaptive downsampling (per method)
-CAMERA_VOXEL_INITIAL = {
-    "depth": 1e-3,
-    "depth_v3": 1e-3,
-    "marigold": 1e-3,
-    "midas": 1e-3,
-    "midas_small": 1e-3,
-    "depth_pro": 0.05,  # Start with 0.05m for depth_pro
-}
+# Use CAMERA_PCD_VOXEL_SIZES as the single source of truth for initial voxel sizes
+CAMERA_VOXEL_INITIAL = CAMERA_PCD_VOXEL_SIZES
 
 # Note: Camera cropping is now controlled via CLI arguments (--crop-z-min, --crop-z-max, --crop-fov-scale)
 # LiDAR cropping is disabled in this version (focus on camera crop only)
@@ -115,6 +109,22 @@ DEFAULT_DEPTH_MODES = {
     "marigold": "raw",        # Marigold: configurable (default raw)
 }
 
+
+
+def resolve_depth_mode(method: str, depth_mode: str) -> str:
+    """
+    Resolve depth mode from "auto" to actual mode.
+    
+    Args:
+        method: Depth method name
+        depth_mode: Processing mode - "auto", "raw", "inv", "one_minus_inv"
+    
+    Returns:
+        Resolved depth mode (one of: "raw", "inv", "one_minus_inv")
+    """
+    if depth_mode == "auto":
+        return DEFAULT_DEPTH_MODES.get(method, "raw")
+    return depth_mode
 
 
 def preprocess_depth(depth: np.ndarray, method: str, depth_mode: str = "auto") -> np.ndarray:
@@ -253,9 +263,9 @@ def crop_camera_by_fov(pcd, fx, fy, fov_scale, verbose=False):
     return pcd.select_by_index(np.where(fov_mask)[0])
 
 
-def apply_camera_crops(pcd_cam, crop_z_min, crop_z_max, crop_fov_scale, fx, fy, verbose=False):
+def apply_camera_crops_metric(pcd_cam, crop_z_min, crop_z_max, crop_fov_scale, fx, fy, verbose=False):
     """
-    Apply Z and optional FOV crops to camera point cloud.
+    Apply Z and optional FOV crops to camera point cloud (METRIC methods only).
     
     Args:
         pcd_cam: Camera point cloud
@@ -289,7 +299,69 @@ def apply_camera_crops(pcd_cam, crop_z_min, crop_z_max, crop_fov_scale, fx, fy, 
     return pcd_cam
 
 
-def backproject_depth(depth_img, fx, fy, cx, cy, method=None, verbose=False):
+def apply_camera_crops_relative(pcd_cam, rel_min_pct, rel_max_pct, crop_fov_scale, fx, fy, invert=False, verbose=False):
+    """
+    Apply Z and optional FOV crops to camera point cloud (RELATIVE methods only).
+    Z crop is based on percentiles of Z values in the point cloud.
+    
+    Args:
+        pcd_cam: Camera point cloud
+        rel_min_pct: Minimum Z percentile (e.g., 2 = 2nd percentile)
+        rel_max_pct: Maximum Z percentile (e.g., 95 = 95th percentile)
+        crop_fov_scale: FOV scale factor (1.0 = no FOV crop)
+        fx: Camera focal length in X
+        fy: Camera focal length in Y
+        invert: If True, invert the percentile interpretation (for "larger = closer" cases)
+        verbose: If True, print crop statistics
+    
+    Returns:
+        Cropped point cloud
+    """
+    n_before = len(pcd_cam.points)
+    
+    if len(pcd_cam.points) == 0:
+        return pcd_cam
+    
+    # Get Z values from point cloud
+    pts = np.asarray(pcd_cam.points)
+    Z = pts[:, 2]  # Z is the third column (depth)
+    valid_z = Z[Z > 1e-6]  # Only consider valid positive Z
+    
+    if len(valid_z) == 0:
+        return pcd_cam
+    
+    # Compute percentile thresholds
+    if invert:
+        # For "larger value = closer": invert percentile interpretation
+        # In this case, higher Z values = closer, so we swap the percentile interpretation
+        # Keep points where Z is between (100-rel_max_pct) and (100-rel_min_pct) percentiles
+        z_min_threshold = np.percentile(valid_z, 100 - rel_max_pct)
+        z_max_threshold = np.percentile(valid_z, 100 - rel_min_pct)
+    else:
+        # Standard: lower percentile = closer, higher percentile = farther
+        z_min_threshold = np.percentile(valid_z, rel_min_pct)
+        z_max_threshold = np.percentile(valid_z, rel_max_pct)
+    
+    # Apply Z crop based on percentiles
+    mask = (Z > z_min_threshold) & (Z < z_max_threshold)
+    pcd_cam = pcd_cam.select_by_index(np.where(mask)[0])
+    n_after_z = len(pcd_cam.points)
+    
+    if verbose:
+        print(f"    Relative Z crop: pct[{rel_min_pct},{rel_max_pct}] => z_min={z_min_threshold:.6f}m, z_max={z_max_threshold:.6f}m, points {n_before} -> {n_after_z}")
+    
+    # Apply FOV crop if requested
+    if crop_fov_scale < 1.0:
+        n_before_fov = n_after_z
+        pcd_cam = crop_camera_by_fov(pcd_cam, fx, fy, crop_fov_scale, verbose=verbose)
+        n_after_fov = len(pcd_cam.points)
+        if verbose:
+            print(f"    Camera crop: {n_before_fov} -> {n_after_fov} points (FOV scale: {crop_fov_scale:.2f})")
+    
+    return pcd_cam
+
+
+def backproject_depth(depth_img, fx, fy, cx, cy, method=None, is_metric_depth=False, verbose=False):
     """
     Backproject depth image to point cloud (no voxel downsampling - returns full cloud after depth filtering).
     
@@ -299,7 +371,8 @@ def backproject_depth(depth_img, fx, fy, cx, cy, method=None, verbose=False):
         fy: Camera focal length in Y
         cx: Camera principal point X
         cy: Camera principal point Y
-        method: Depth method name (for method-aware filtering)
+        method: Depth method name (for logging)
+        is_metric_depth: If True, use metric depth range filtering; if False, use percentile filtering
         verbose: If True, print filtering statistics
     
     Returns:
@@ -342,8 +415,8 @@ def backproject_depth(depth_img, fx, fy, cx, cy, method=None, verbose=False):
             z_percentiles = np.percentile(valid_z, [1, 5, 25, 50, 75, 95, 99])
             print(f"    Z percentiles before filtering: [1, 5, 25, 50, 75, 95, 99] = {z_percentiles}")
 
-    # Apply method-aware depth range filtering
-    if method in ["depth_pro", "depth_v3"]:
+    # Apply depth range filtering based on is_metric_depth flag
+    if is_metric_depth:
         # Metric methods: use fixed range in meters (with per-method override if available)
         MIN_Z = DEPTH_RANGE_METRIC["MIN_Z"]
         MAX_Z = DEPTH_RANGE_METRIC_OVERRIDE.get(method, DEPTH_RANGE_METRIC["MAX_Z"])
@@ -409,10 +482,10 @@ def adaptive_voxel_downsample(pcd, method=None, verbose=False):
     # Get initial voxel size
     initial_voxel_size = CAMERA_VOXEL_INITIAL.get(method, CAMERA_PCD_VOXEL_SIZE)
     current_voxel_size = initial_voxel_size
-    max_iterations = 10
-    iteration = 0
     
-    while iteration < max_iterations:
+    # Keep increasing voxel size until target is reached or max cap is hit
+    # Do not stop at max_iterations - keep going until convergence or cap
+    while True:
         pcd_down = pcd.voxel_down_sample(voxel_size=current_voxel_size)
         n_post = len(pcd_down.points)
         
@@ -424,7 +497,7 @@ def adaptive_voxel_downsample(pcd, method=None, verbose=False):
             # Hit max voxel cap, stop increasing
             pcd = pcd_down
             if verbose:
-                print(f"    WARNING: Hit max voxel cap ({MAX_CAM_VOXEL:.3f}m) with {n_post} points (> {TARGET_MAX_POINTS})")
+                print(f"    WARNING: Stopped at max voxel cap ({MAX_CAM_VOXEL:.3f}m) with {n_post} points (> {TARGET_MAX_POINTS})")
             break
         else:
             # Increase voxel size and try again (but don't exceed cap)
@@ -433,7 +506,6 @@ def adaptive_voxel_downsample(pcd, method=None, verbose=False):
                 current_voxel_size = MAX_CAM_VOXEL
             else:
                 current_voxel_size = next_voxel_size
-            iteration += 1
             if verbose:
                 print(f"    Voxel size {current_voxel_size/1.5:.6f}m -> {current_voxel_size:.6f}m (points: {n_post} > {TARGET_MAX_POINTS})")
     
@@ -615,7 +687,8 @@ def find_correspondences_fpfh(feats0, feats1, mutual_filter=True):
 
 
 def process_pair(idx, depth_dir, depth_method, meta_path, verbose=False, estimate_scaling=True, depth_mode="auto", is_first_frame=False,
-                 crop_z_min=2.0, crop_z_max=50.0, crop_fov_scale=0.8, viz=False, viz_after=False, viz_frame_idx=0, k_scale=2.0):
+                 crop_z_min=2.0, crop_z_max=50.0, crop_fov_scale=0.8, viz=False, viz_after=False, viz_frame_idx=0, k_scale=2.0,
+                 rel_crop_min_pct=2, rel_crop_max_pct=95, rel_crop_invert=False):
     """
     Process a single depth-LiDAR pair.
     
@@ -651,8 +724,16 @@ def process_pair(idx, depth_dir, depth_method, meta_path, verbose=False, estimat
         percentiles = np.percentile(depth_raw, [1, 5, 95, 99])
         print(f"    Percentiles [1, 5, 95, 99]: {percentiles}")
     
-    # Preprocess depth based on method
-    depth_processed = preprocess_depth(depth_raw, depth_method, depth_mode)
+    # Resolve effective depth mode and determine if this is metric depth
+    effective_mode = resolve_depth_mode(depth_method, depth_mode)
+    is_metric_depth = (depth_method in ["depth_pro", "depth_v3"]) and (effective_mode == "raw")
+    
+    # Log depth mode resolution for verification
+    if is_first_frame or verbose:
+        print(f"  [{idx}] Depth mode resolved: requested={depth_mode}, effective={effective_mode}, is_metric_depth={is_metric_depth}")
+    
+    # Preprocess depth based on method (pass resolved mode)
+    depth_processed = preprocess_depth(depth_raw, depth_method, effective_mode)
     
     # Print post-preprocess statistics for first frame
     if is_first_frame:
@@ -691,6 +772,7 @@ def process_pair(idx, depth_dir, depth_method, meta_path, verbose=False, estimat
         depth_processed,
         fx_eff, fy_eff, cx_eff, cy_eff,
         method=depth_method,
+        is_metric_depth=is_metric_depth,
         verbose=is_first_frame
     )
     
@@ -706,8 +788,14 @@ def process_pair(idx, depth_dir, depth_method, meta_path, verbose=False, estimat
     
     # Apply principled camera crops (Z range + optional FOV) using scaled intrinsics
     # Crop BEFORE adaptive voxel sizing to avoid absurd voxel sizes from far points
+    # Route to metric or relative crop function based on is_metric_depth flag
     n_cam_pre_crop = len(pcd_cam_full.points)
-    pcd_cam_crop = apply_camera_crops(pcd_cam_full, crop_z_min, crop_z_max, crop_fov_scale, fx_eff, fy_eff, verbose=verbose or is_first_frame)
+    if is_metric_depth:
+        # Metric methods: use absolute Z range in meters
+        pcd_cam_crop = apply_camera_crops_metric(pcd_cam_full, crop_z_min, crop_z_max, crop_fov_scale, fx_eff, fy_eff, verbose=verbose or is_first_frame)
+    else:
+        # Relative methods: use percentile-based Z cropping
+        pcd_cam_crop = apply_camera_crops_relative(pcd_cam_full, rel_crop_min_pct, rel_crop_max_pct, crop_fov_scale, fx_eff, fy_eff, invert=rel_crop_invert, verbose=verbose or is_first_frame)
     n_cam_post_crop = len(pcd_cam_crop.points)
     
     if n_cam_post_crop < 100:
@@ -944,7 +1032,8 @@ def process_pair(idx, depth_dir, depth_method, meta_path, verbose=False, estimat
 
 
 def process_depth_method(depth_method, depth_dir, limit=None, test_mode=False, estimate_scaling=True, depth_mode_dict=None,
-                         crop_z_min=2.0, crop_z_max=50.0, crop_fov_scale=0.8, viz=False, viz_after=False, viz_frame_idx=0, k_scale=2.0):
+                         crop_z_min=2.0, crop_z_max=50.0, crop_fov_scale=0.8, viz=False, viz_after=False, viz_frame_idx=0, k_scale=2.0,
+                         rel_crop_min_pct=2, rel_crop_max_pct=95, rel_crop_invert=False):
     """
     Process all files for a given depth method.
     
@@ -1010,7 +1099,10 @@ def process_depth_method(depth_method, depth_dir, limit=None, test_mode=False, e
             viz=should_viz_frame,
             viz_after=viz_after if should_viz_frame else False,
             viz_frame_idx=viz_frame_idx,
-            k_scale=k_scale
+            k_scale=k_scale,
+            rel_crop_min_pct=rel_crop_min_pct,
+            rel_crop_max_pct=rel_crop_max_pct,
+            rel_crop_invert=rel_crop_invert
         )
         if result:
             processed += 1
@@ -1092,6 +1184,23 @@ if __name__ == "__main__":
         default=2.0,
         help="Scale factor for camera intrinsics (fx, fy, cx, cy). Default: 2.0 (for 2x resolution depth maps)"
     )
+    parser.add_argument(
+        "--rel-crop-min-pct",
+        type=float,
+        default=2,
+        help="Minimum Z percentile for relative depth methods (MiDaS, Marigold, etc.). Default: 2 (2nd percentile)"
+    )
+    parser.add_argument(
+        "--rel-crop-max-pct",
+        type=float,
+        default=95,
+        help="Maximum Z percentile for relative depth methods (MiDaS, Marigold, etc.). Default: 95 (95th percentile)"
+    )
+    parser.add_argument(
+        "--rel-crop-invert",
+        action="store_true",
+        help="Invert percentile interpretation for relative depth methods (for 'larger value = closer' cases)"
+    )
     args = parser.parse_args()
     
     # Determine which methods to process
@@ -1163,7 +1272,10 @@ if __name__ == "__main__":
             viz=args.viz,
             viz_after=args.viz_after,
             viz_frame_idx=args.viz_frame_idx,
-            k_scale=args.k_scale
+            k_scale=args.k_scale,
+            rel_crop_min_pct=args.rel_crop_min_pct,
+            rel_crop_max_pct=args.rel_crop_max_pct,
+            rel_crop_invert=args.rel_crop_invert
         )
         total_processed += processed
     
