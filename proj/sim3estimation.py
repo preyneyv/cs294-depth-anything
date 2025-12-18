@@ -67,7 +67,7 @@ TARGET_MAX_POINTS = 20000
 # MAX_POINTS_WARNING_THRESHOLD: Passive warning - if point count exceeds this AFTER adaptive sizing,
 #                               prints a warning but takes no action. Should be higher than TARGET.
 #                               Indicates the initial voxel size might be too small or data is very dense.
-MAX_POINTS_WARNING_THRESHOLD = 15001
+MAX_POINTS_WARNING_THRESHOLD = int(TARGET_MAX_POINTS * 1.25)
 
 # Maximum camera voxel size cap to prevent destroying local geometry
 MAX_CAM_VOXEL = 0.30  # meters - maximum voxel size for adaptive downsampling
@@ -536,7 +536,7 @@ def find_correspondences_ransac_fpfh(pcd_src, pcd_tgt, voxel_size, mutual_filter
         estimation_method=estimation_method,
         ransac_n=ransac_n,
         checkers=checkers,
-        criteria=o3d.pipelines.registration.RANSACConvergenceCriteria(4000000, 500)
+        criteria=o3d.pipelines.registration.RANSACConvergenceCriteria(500000, 500) #was 4000000
     )
     
     # Extract correspondences from RANSAC result
