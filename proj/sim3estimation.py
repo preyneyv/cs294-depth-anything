@@ -6,6 +6,8 @@ from tqdm import tqdm
 from align_teaser import sim3_teaser_pipeline
 import json
 import argparse
+import time
+import copy
 
 # === Batch SIM(3) Alignment Pipeline ===
 # Folder structure expected:
@@ -70,6 +72,16 @@ DEPTH_RANGE_PERCENTILES = {
     "MAX_PERCENTILE": 95.0, # 95th percentile
 }
 
+# Per-method default depth modes
+DEFAULT_DEPTH_MODES = {
+    "depth": "raw",           # Depth Anything v2: raw (percentile clip)
+    "depth_v3": "raw",        # Depth Anything v3: raw (metric range clip)
+    "midas": "raw",           # MiDaS: raw (relative depth; percentile clip)
+    "midas_small": "raw",     # MiDaS Small: raw (relative depth; percentile clip)
+    "depth_pro": "raw",       # Depth Pro: raw (metric clip)
+    "marigold": "raw",        # Marigold: configurable (default raw)
+}
+
 
 
 def preprocess_depth(depth: np.ndarray, method: str, depth_mode: str = "auto") -> np.ndarray:
@@ -109,19 +121,8 @@ def preprocess_depth(depth: np.ndarray, method: str, depth_mode: str = "auto") -
     
     # Determine processing mode
     if depth_mode == "auto":
-        # Per-method defaults
-        if method in ["depth", "depth_v3", "midas", "midas_small"]:
-            depth_mode = "inv"  # Inverse depth-like
-        elif method == "depth_pro":
-            depth_mode = "raw"  # Direct metric depth
-        elif method == "marigold":
-            # Check if normalized [0,1]
-            if np.nanmax(depth) <= 1.0 and np.nanmin(depth) >= 0:
-                depth_mode = "one_minus_inv"  # Normalized inverse depth visualization
-            else:
-                depth_mode = "inv"  # Fallback to inverse depth
-        else:
-            depth_mode = "inv"  # Default fallback
+        # Use per-method defaults
+        depth_mode = DEFAULT_DEPTH_MODES.get(method, "raw")
     
     # Apply preprocessing
     if depth_mode == "raw":
@@ -191,6 +192,13 @@ def backproject_depth(depth_img, voxel_size=None, method=None, verbose=False):
     pts = np.vstack((X, Y, Z)).T
     n_before_filter = len(pts)
 
+    # Debug: Print Z percentiles before filtering
+    if verbose:
+        valid_z = Z[Z > 1e-6]
+        if len(valid_z) > 0:
+            z_percentiles = np.percentile(valid_z, [1, 5, 25, 50, 75, 95, 99])
+            print(f"    Z percentiles before filtering: [1, 5, 25, 50, 75, 95, 99] = {z_percentiles}")
+
     # Apply method-aware depth range filtering
     if method in ["depth_pro", "depth_v3"]:
         # Metric methods: use fixed range in meters
@@ -222,16 +230,8 @@ def backproject_depth(depth_img, voxel_size=None, method=None, verbose=False):
         pcd = o3d.geometry.PointCloud()
         return pcd, 0, 0, n_filtered
 
-    # [CHECK THIS MANUALLY]
-    # post-process to get x-y-z axis in the same direction with LiDAR pcd
-    pts[:, 1] = -pts[:, 1] # invert y axis
-    # Filter by x-range, rm noisy points
-    mask = (pts[:, 0] > -0.01) & (pts[:, 0] < 0.01)
-    pts = pts[mask]
-
-    if len(pts) == 0:
-        pcd = o3d.geometry.PointCloud()
-        return pcd, 0, 0
+    # Keep points in standard camera coordinates (X right, Y down, Z forward)
+    # Do not flip axes here - any frame transforms should be done explicitly and consistently
 
     pcd = o3d.geometry.PointCloud()
     pcd.points = o3d.utility.Vector3dVector(pts)
@@ -248,7 +248,88 @@ def backproject_depth(depth_img, voxel_size=None, method=None, verbose=False):
         pcd = pcd.select_by_index(indices)
         n_post = MAX_POINTS_AFTER_DOWNSAMPLE
 
+    if verbose:
+        print(f"    Points kept after depth filtering: {len(pts)}")
+        print(f"    Final point count after downsampling: {n_post}")
+    
     return pcd, n_pre, n_post, n_filtered
+
+
+def extract_fpfh_features(pcd, voxel_size):
+    """
+    Extract FPFH features from a point cloud.
+    
+    Args:
+        pcd: Open3D point cloud
+        voxel_size: Voxel size for feature radius calculation
+    
+    Returns:
+        FPFH features as numpy array (N, 33)
+    """
+    radius_normal = voxel_size * 2
+    pcd.estimate_normals(
+        o3d.geometry.KDTreeSearchParamHybrid(radius=radius_normal, max_nn=30))
+    
+    radius_feature = voxel_size * 5
+    fpfh = o3d.pipelines.registration.compute_fpfh_feature(
+        pcd, o3d.geometry.KDTreeSearchParamHybrid(radius=radius_feature, max_nn=100))
+    return np.array(fpfh.data).T
+
+
+def find_correspondences_fpfh(feats0, feats1, mutual_filter=True):
+    """
+    Find correspondences using FPFH features via nearest neighbor search.
+    Uses chunked numpy computation to avoid scipy dependency and memory issues.
+    
+    Args:
+        feats0: Source features (N, 33)
+        feats1: Target features (M, 33)
+        mutual_filter: If True, apply mutual nearest neighbor filter
+    
+    Returns:
+        corres_idx0, corres_idx1: Corresponding indices
+    """
+    # Find nearest neighbors: feats0 -> feats1
+    # Use chunked computation to avoid memory issues with large feature sets
+    chunk_size = 1000
+    n0 = len(feats0)
+    nn_inds01 = np.zeros(n0, dtype=np.int64)
+    
+    for i in range(0, n0, chunk_size):
+        end_idx = min(i + chunk_size, n0)
+        chunk = feats0[i:end_idx]
+        # Compute squared distances: (chunk_size, M)
+        dists = np.sum((chunk[:, np.newaxis, :] - feats1[np.newaxis, :, :]) ** 2, axis=2)
+        nn_inds01[i:end_idx] = np.argmin(dists, axis=1)
+    
+    corres01_idx0 = np.arange(len(feats0))
+    corres01_idx1 = nn_inds01
+    
+    if not mutual_filter:
+        return corres01_idx0, corres01_idx1
+    
+    # Mutual filter: also check feats1 -> feats0
+    n1 = len(feats1)
+    nn_inds10 = np.zeros(n1, dtype=np.int64)
+    
+    for i in range(0, n1, chunk_size):
+        end_idx = min(i + chunk_size, n1)
+        chunk = feats1[i:end_idx]
+        dists = np.sum((chunk[:, np.newaxis, :] - feats0[np.newaxis, :, :]) ** 2, axis=2)
+        nn_inds10[i:end_idx] = np.argmin(dists, axis=1)
+    
+    corres10_idx1 = np.arange(len(feats1))
+    corres10_idx0 = nn_inds10
+    
+    # Keep only mutual correspondences
+    # A correspondence (i, j) is mutual if:
+    # - j is the nearest neighbor of i in feats1, AND
+    # - i is the nearest neighbor of j in feats0
+    mutual_mask = (corres10_idx0[corres01_idx1] == corres01_idx0)
+    corres_idx0 = corres01_idx0[mutual_mask]
+    corres_idx1 = corres01_idx1[mutual_mask]
+    
+    return corres_idx0, corres_idx1
 
 
 def process_pair(idx, depth_dir, depth_method, meta_path, verbose=False, estimate_scaling=True, depth_mode="auto", is_first_frame=False):
@@ -301,6 +382,8 @@ def process_pair(idx, depth_dir, depth_method, meta_path, verbose=False, estimat
             print(f"    Min:   {depth_valid.min():.6f}")
             print(f"    Max:   {depth_valid.max():.6f}")
             print(f"    Mean:  {depth_valid.mean():.6f}")
+            z_percentiles = np.percentile(depth_valid, [1, 5, 25, 50, 75, 95, 99])
+            print(f"    Z percentiles [1, 5, 25, 50, 75, 95, 99]: {z_percentiles}")
         else:
             print(f"    WARNING: No valid pixels after preprocessing!")
     
@@ -341,10 +424,10 @@ def process_pair(idx, depth_dir, depth_method, meta_path, verbose=False, estimat
         print(f"  [{idx}] LiDAR PCD: {n_lidar_pre} points, processing axes...")
 
     # [CHECK THE AXIS MANUALLY] post-process to get x-y-z axis
-    pts_lidar = np.asarray(pcd_lidar.points)[:, [1, 2, 0]] # Remap axes: (y, z, x) --> (x, y, z)
-    pts_lidar[:, 0] = -pts_lidar[:, 0] # invert x axis
+    pts_lidar_raw = np.asarray(pcd_lidar.points)[:, [1, 2, 0]] # Remap axes: (y, z, x) --> (x, y, z)
+    pts_lidar_raw[:, 0] = -pts_lidar_raw[:, 0] # invert x axis
 
-    pcd_lidar.points = o3d.utility.Vector3dVector(pts_lidar)
+    pcd_lidar.points = o3d.utility.Vector3dVector(pts_lidar_raw)
 
     # Downsample to reduce point count for faster processing
     print(f"  [{idx}] lidar points pre-voxel: {n_lidar_pre}")
@@ -359,6 +442,9 @@ def process_pair(idx, depth_dir, depth_method, meta_path, verbose=False, estimat
     
     print(f"  [{idx}] lidar points post-voxel: {n_lidar_post}")
     
+    # Extract LiDAR points AFTER downsampling/capping to match the point cloud
+    pts_lidar = np.asarray(pcd_lidar.points).copy()
+    
     n_lidar = len(pcd_lidar.points)
     if n_lidar < 100:
         print(f"  [{idx}] SKIP: too few LiDAR points (lidar={n_lidar})")
@@ -369,24 +455,72 @@ def process_pair(idx, depth_dir, depth_method, meta_path, verbose=False, estimat
         print(f"  [{idx}] SKIP: too few points (cam={n_cam}, lidar={n_lidar})")
         return None
     
-    # Guard: ensure at least 3 correspondences (minimum for 3D transformation)
-    n_corr = min(len(points_cam), len(pts_lidar))
+    if verbose:
+        print(f"  [{idx}] Extracting FPFH features for correspondence matching...")
+    
+    # Extract FPFH features for both point clouds
+    start_time = time.time()
+    cam_voxel_size = CAMERA_PCD_VOXEL_SIZES.get(depth_method, CAMERA_PCD_VOXEL_SIZE)
+    feats_cam = extract_fpfh_features(pcd_cam, cam_voxel_size)
+    feats_lidar = extract_fpfh_features(pcd_lidar, LIDAR_PCD_VOXEL_SIZE)
+    
+    # Find correspondences using FPFH features
+    corres_idx0, corres_idx1 = find_correspondences_fpfh(feats_cam, feats_lidar, mutual_filter=True)
+    n_corr = len(corres_idx0)
+    feature_time = time.time() - start_time
+    
+    if verbose:
+        print(f"  [{idx}] FPFH feature extraction and matching: {feature_time:.3f}s")
+        print(f"  [{idx}] Found {n_corr} correspondences (mutual nearest neighbor)")
+    
     if n_corr < 3:
         print(f"  [{idx}] SKIP: too few correspondences (n={n_corr}, need >= 3)")
         return None
     
+    # Extract corresponding points
+    points_cam_corr = np.asarray(pcd_cam.points)[corres_idx0]
+    pts_lidar_corr = pts_lidar[corres_idx1]
+    
     if verbose:
-        print(f"  [{idx}] Running TEASER++ alignment (this may take a moment)...")
-
+        print(f"  [{idx}] Running TEASER++ alignment with {n_corr} correspondences...")
+    
+    # Run TEASER++ with feature-based correspondences
+    teaser_start = time.time()
     cam_aligned, metadata = sim3_teaser_pipeline(
         pcd_cam,
         pcd_lidar,
         0.05,
-        points_cam,
-        pts_lidar,
+        points_cam_corr,
+        pts_lidar_corr,
         verbose=verbose,
         estimate_scaling=estimate_scaling
     )
+    teaser_time = time.time() - teaser_start
+    
+    # Calculate inlier ratio (points within noise_bound after transformation)
+    if 'final_T' in metadata:
+        # Transform camera correspondences using final transformation
+        T = metadata['final_T']
+        R = T[:3, :3]
+        t = T[:3, 3]
+        # Apply transformation: transformed = R @ points.T + t
+        points_cam_corr_transformed = (R @ points_cam_corr.T).T + t
+        # Compute distances between transformed camera points and LiDAR correspondences
+        dists = np.linalg.norm(points_cam_corr_transformed - pts_lidar_corr, axis=1)
+        noise_bound = 0.05
+        inlier_ratio = np.sum(dists < noise_bound * 1.5) / len(dists) if len(dists) > 0 else 0.0
+        metadata['correspondences_count'] = n_corr
+        metadata['inlier_ratio'] = float(inlier_ratio)
+        metadata['teaser_runtime'] = teaser_time
+        metadata['feature_extraction_time'] = feature_time
+        
+        if verbose:
+            print(f"  [{idx}] TEASER++ runtime: {teaser_time:.3f}s")
+            print(f"  [{idx}] Inlier ratio: {inlier_ratio:.4f} ({np.sum(dists < noise_bound * 1.5)}/{n_corr})")
+    else:
+        metadata['correspondences_count'] = n_corr
+        metadata['teaser_runtime'] = teaser_time
+        metadata['feature_extraction_time'] = feature_time
     
     if verbose:
         print(f"  [{idx}] TEASER++ complete: scale={metadata['s']:.4f}, fitness={metadata['fitness']:.4f}, RMSE={metadata['rmse']:.6f}")
@@ -407,7 +541,7 @@ def process_pair(idx, depth_dir, depth_method, meta_path, verbose=False, estimat
     return save_path
 
 
-def process_depth_method(depth_method, depth_dir, limit=None, test_mode=False, estimate_scaling=True, depth_mode="auto"):
+def process_depth_method(depth_method, depth_dir, limit=None, test_mode=False, estimate_scaling=True, depth_mode_dict=None):
     """
     Process all files for a given depth method.
     
@@ -416,7 +550,8 @@ def process_depth_method(depth_method, depth_dir, limit=None, test_mode=False, e
         depth_dir: Path to depth directory
         limit: Optional limit on number of files to process (for testing)
         test_mode: If True, only process first 3 files
-        depth_mode: Depth preprocessing mode ("auto", "raw", "inv", "one_minus_inv")
+        estimate_scaling: Whether to estimate scale in TEASER++
+        depth_mode_dict: Dict mapping method names to depth modes (or None for auto)
     """
     print(f"\n{'='*60}")
     print(f"Processing depth method: {depth_method}")
@@ -447,6 +582,12 @@ def process_depth_method(depth_method, depth_dir, limit=None, test_mode=False, e
     meta_path = OUTPUT_DIR / f"metadata_{depth_method}.jsonl"
     with open(meta_path, "w") as f:
         pass  # Clear/create file
+    
+    # Get depth mode for this method
+    if depth_mode_dict and depth_method in depth_mode_dict:
+        depth_mode = depth_mode_dict[depth_method]
+    else:
+        depth_mode = "auto"
     
     processed = 0
     for i, idx in enumerate(tqdm(all_indices, desc=f"Aligning {depth_method}", ncols=100, disable=test_mode)):
@@ -495,9 +636,8 @@ if __name__ == "__main__":
     parser.add_argument(
         "--depth-mode",
         type=str,
-        choices=["auto", "raw", "inv", "one_minus_inv"],
-        default="auto",
-        help="Depth preprocessing mode: auto (method-specific), raw (direct metric), inv (1/depth), one_minus_inv (1/(1-depth))"
+        default=None,
+        help="Per-method depth mode override in format METHOD1=mode1,METHOD2=mode2 (e.g., 'depth=raw,marigold=inv'). Modes: auto, raw, inv, one_minus_inv"
     )
     args = parser.parse_args()
     
@@ -514,8 +654,33 @@ if __name__ == "__main__":
         print(f"LIMIT MODE: Processing only first {args.limit} files per method")
     if args.no_scale:
         print("SCALE ESTIMATION: DISABLED (faster, more stable)")
-    if args.depth_mode != "auto":
-        print(f"DEPTH MODE: {args.depth_mode} (overriding method defaults)")
+    
+    # Parse per-method depth mode overrides
+    depth_mode_dict = {}
+    if args.depth_mode:
+        print(f"DEPTH MODE OVERRIDES: {args.depth_mode}")
+        for override in args.depth_mode.split(','):
+            if '=' in override:
+                method_name, mode = override.strip().split('=')
+                method_name = method_name.strip()
+                mode = mode.strip()
+                if method_name in DEPTH_DIRS:
+                    if mode in ["auto", "raw", "inv", "one_minus_inv"]:
+                        depth_mode_dict[method_name] = mode
+                        print(f"  {method_name} -> {mode}")
+                    else:
+                        print(f"  WARNING: Invalid mode '{mode}' for {method_name}, ignoring")
+                else:
+                    print(f"  WARNING: Unknown method '{method_name}', ignoring")
+            else:
+                print(f"  WARNING: Invalid format '{override}', expected METHOD=mode")
+    
+    # Print default depth modes
+    if not depth_mode_dict:
+        print("DEPTH MODES: Using method-specific defaults")
+        for method in methods_to_process:
+            default_mode = DEFAULT_DEPTH_MODES.get(method, "raw")
+            print(f"  {method} -> {default_mode} (default)")
     
     estimate_scaling = not args.no_scale
     
@@ -528,7 +693,7 @@ if __name__ == "__main__":
             limit=args.limit,
             test_mode=args.test,
             estimate_scaling=estimate_scaling,
-            depth_mode=args.depth_mode
+            depth_mode_dict=depth_mode_dict
         )
         total_processed += processed
     
