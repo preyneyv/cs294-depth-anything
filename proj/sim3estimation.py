@@ -81,7 +81,7 @@ CAMERA_VOXEL_INITIAL = CAMERA_PCD_VOXEL_SIZES
 
 # Feature extraction voxel size for RANSAC-based correspondence matching
 # Use same size for both source and target clouds
-FEATURE_VOXEL_SIZE = 0.05  # 0.05m for feature matching
+FEATURE_VOXEL_SIZE = 0.5  # 0.5m for feature matching (increased for driving scenes)
 
 # Depth range filtering parameters
 # For metric methods (depth_pro, depth_v3): use fixed range in meters
@@ -101,7 +101,7 @@ DEPTH_RANGE_PERCENTILES = {
 
 # Per-method default depth modes
 DEFAULT_DEPTH_MODES = {
-    "depth": "raw",           # Depth Anything v2: raw (percentile clip)
+    "depth": "raw",           # Depth Anything v2: raw (metric, with hard Z clamp for scale matching)
     "depth_v3": "raw",        # Depth Anything v3: raw (metric range clip)
     "midas": "raw",           # MiDaS: raw (relative depth; percentile clip)
     "midas_small": "raw",     # MiDaS Small: raw (relative depth; percentile clip)
@@ -586,8 +586,8 @@ def find_correspondences_ransac_fpfh(pcd_src, pcd_tgt, voxel_size, mutual_filter
         o3d.geometry.KDTreeSearchParamHybrid(radius=radius_feature, max_nn=100))
     
     # RANSAC-based global registration
-    # Use larger max_correspondence_distance to be less aggressive with filtering
-    max_correspondence_distance = voxel_size * 2.0
+    # More tolerant initial matching; tighten later once it works
+    max_correspondence_distance = voxel_size * 5.0
     
     # Set up checkers - use less strict edge length checker to allow more correspondences
     checkers = [
@@ -688,7 +688,7 @@ def find_correspondences_fpfh(feats0, feats1, mutual_filter=True):
 
 def process_pair(idx, depth_dir, depth_method, meta_path, verbose=False, estimate_scaling=True, depth_mode="auto", is_first_frame=False,
                  crop_z_min=2.0, crop_z_max=50.0, crop_fov_scale=0.8, viz=False, viz_after=False, viz_frame_idx=0, k_scale=2.0,
-                 rel_crop_min_pct=2, rel_crop_max_pct=95, rel_crop_invert=False):
+                 rel_crop_min_pct=2, rel_crop_max_pct=95, rel_crop_invert=False, max_teaser_corr=800):
     """
     Process a single depth-LiDAR pair.
     
@@ -726,7 +726,7 @@ def process_pair(idx, depth_dir, depth_method, meta_path, verbose=False, estimat
     
     # Resolve effective depth mode and determine if this is metric depth
     effective_mode = resolve_depth_mode(depth_method, depth_mode)
-    is_metric_depth = (depth_method in ["depth_pro", "depth_v3"]) and (effective_mode == "raw")
+    is_metric_depth = (depth_method in ["depth_pro", "depth"]) and (effective_mode == "raw")
     
     # Log depth mode resolution for verification
     if is_first_frame or verbose:
@@ -798,8 +798,21 @@ def process_pair(idx, depth_dir, depth_method, meta_path, verbose=False, estimat
         pcd_cam_crop = apply_camera_crops_relative(pcd_cam_full, rel_crop_min_pct, rel_crop_max_pct, crop_fov_scale, fx_eff, fy_eff, invert=rel_crop_invert, verbose=verbose or is_first_frame)
     n_cam_post_crop = len(pcd_cam_crop.points)
     
-    if n_cam_post_crop < 100:
-        print(f"  [{idx}] SKIP: too few camera points after cropping (cam={n_cam_post_crop})")
+    # Hard metric Z clamp: enforce Z range after all cropping (applies to all methods)
+    # This ensures camera cloud is in same physical scale as LiDAR
+    pcd_cam_crop = crop_camera_by_z(pcd_cam_crop, crop_z_min, crop_z_max)
+    n_cam_post_hard_clamp = len(pcd_cam_crop.points)
+    if verbose or is_first_frame:
+        # Get actual Z range for logging
+        if len(pcd_cam_crop.points) > 0:
+            pts_crop = np.asarray(pcd_cam_crop.points)
+            z_vals = pts_crop[:, 2]
+            z_min_actual = z_vals.min()
+            z_max_actual = z_vals.max()
+            print(f"    Hard Z clamp applied: {n_cam_post_crop} -> {n_cam_post_hard_clamp} points, Z range: [{z_min_actual:.2f}, {z_max_actual:.2f}]m")
+    
+    if n_cam_post_hard_clamp < 100:
+        print(f"  [{idx}] SKIP: too few camera points after hard Z clamp (cam={n_cam_post_hard_clamp})")
         return None
     
     # Apply adaptive voxel downsampling on CROPPED cloud only
@@ -807,12 +820,23 @@ def process_pair(idx, depth_dir, depth_method, meta_path, verbose=False, estimat
         pcd_cam_crop, method=depth_method, verbose=verbose or is_first_frame
     )
     
+    # Emergency downsample if still too many points after adaptive voxel
+    if len(pcd_cam.points) > TARGET_MAX_POINTS:
+        emergency_voxel = max(final_voxel_size, 0.75)
+        pcd_cam = pcd_cam.voxel_down_sample(voxel_size=emergency_voxel)
+        n_cam_emergency = len(pcd_cam.points)
+        if verbose or is_first_frame:
+            print(f"    Emergency downsample: {n_cam_post_voxel} -> {n_cam_emergency} points (voxel: {emergency_voxel:.3f}m)")
+        final_voxel_size = emergency_voxel
+        n_cam_post_voxel = n_cam_emergency
+    
     # Log point counts at each stage
     if verbose or is_first_frame:
         print(f"  [{idx}] Camera point cloud stages:")
         print(f"    Full backprojection: {n_cam_before_filter} points")
         print(f"    After depth filter: {n_cam_after_filter} points (removed {n_filtered})")
         print(f"    After crop: {n_cam_post_crop} points")
+        print(f"    After hard Z clamp: {n_cam_post_hard_clamp} points")
         print(f"    After adaptive voxel ({final_voxel_size:.6f}m): {n_cam_post_voxel} points")
     
     n_cam = len(pcd_cam.points)
@@ -879,10 +903,34 @@ def process_pair(idx, depth_dir, depth_method, meta_path, verbose=False, estimat
     if verbose:
         print(f"  [{idx}] Running RANSAC-based FPFH correspondence matching...")
     
+    # Sanity check: Print Z ranges before RANSAC to verify scale matching
+    if verbose or is_first_frame:
+        cam_pts = np.asarray(pcd_cam.points)
+        lidar_pts = np.asarray(pcd_lidar.points)
+        if len(cam_pts) > 0 and len(lidar_pts) > 0:
+            cam_z_min, cam_z_max = cam_pts[:, 2].min(), cam_pts[:, 2].max()
+            lidar_z_min, lidar_z_max = lidar_pts[:, 2].min(), lidar_pts[:, 2].max()
+            cam_x_min, cam_x_max = cam_pts[:, 0].min(), cam_pts[:, 0].max()
+            lidar_x_min, lidar_x_max = lidar_pts[:, 0].min(), lidar_pts[:, 0].max()
+            print(f"  [{idx}] Pre-RANSAC Z ranges: Camera Z[{cam_z_min:.2f}, {cam_z_max:.2f}]m, LiDAR Z[{lidar_z_min:.2f}, {lidar_z_max:.2f}]m")
+            print(f"  [{idx}] Pre-RANSAC X ranges: Camera X[{cam_x_min:.2f}, {cam_x_max:.2f}]m, LiDAR X[{lidar_x_min:.2f}, {lidar_x_max:.2f}]m")
+            if cam_z_max > 100.0:
+                print(f"  [{idx}] WARNING: Camera Z max is {cam_z_max:.2f}m (>100m) - scale may still be incorrect!")
+    
     # Use RANSAC-based global registration for correspondences
+    # --- Feature voxel size MUST match actual point spacing ---
+    # final_voxel_size comes from adaptive_voxel_downsample(pcd_cam_crop, ...)
+    # Use the larger of camera spacing and lidar spacing for stable FPFH/RANSAC
+    voxel_feat = max(final_voxel_size, LIDAR_PCD_VOXEL_SIZE)
+    
+    # --- Stable FPFH: match densities explicitly ---
+    pcd_cam_feat = pcd_cam.voxel_down_sample(voxel_feat) if len(pcd_cam.points) > 10000 else pcd_cam
+    pcd_lidar_feat = pcd_lidar.voxel_down_sample(voxel_feat) if len(pcd_lidar.points) > 10000 else pcd_lidar
+    
+    # Start WITHOUT mutual filtering (mutual filter often kills matches when features are weak)
     start_time = time.time()
     points_cam_corr, pts_lidar_corr, ransac_result = find_correspondences_ransac_fpfh(
-        pcd_cam, pcd_lidar, FEATURE_VOXEL_SIZE, mutual_filter=True
+        pcd_cam_feat, pcd_lidar_feat, voxel_feat, mutual_filter=False
     )
     feature_time = time.time() - start_time
     
@@ -943,6 +991,19 @@ def process_pair(idx, depth_dir, depth_method, meta_path, verbose=False, estimat
     if n_corr < 3:
         print(f"  [{idx}] SKIP: too few correspondences from RANSAC (n={n_corr}, need >= 3)")
         return None
+    
+    # Cap correspondences before TEASER++ to prevent max-clique blowups
+    n_corr_original = n_corr
+    if n_corr > max_teaser_corr:
+        # Deterministic subsampling using fixed seed
+        rng = np.random.default_rng(0)
+        perm = rng.permutation(n_corr)
+        keep_indices = perm[:max_teaser_corr]
+        points_cam_corr = points_cam_corr[keep_indices]
+        pts_lidar_corr = pts_lidar_corr[keep_indices]
+        n_corr = len(points_cam_corr)
+        if verbose:
+            print(f"  [{idx}] Capped correspondences: {n_corr_original} -> {n_corr} (seed=0)")
     
     if verbose:
         print(f"  [{idx}] Running TEASER++ alignment with {n_corr} correspondences...")
@@ -1033,7 +1094,7 @@ def process_pair(idx, depth_dir, depth_method, meta_path, verbose=False, estimat
 
 def process_depth_method(depth_method, depth_dir, limit=None, test_mode=False, estimate_scaling=True, depth_mode_dict=None,
                          crop_z_min=2.0, crop_z_max=50.0, crop_fov_scale=0.8, viz=False, viz_after=False, viz_frame_idx=0, k_scale=2.0,
-                         rel_crop_min_pct=2, rel_crop_max_pct=95, rel_crop_invert=False):
+                         rel_crop_min_pct=2, rel_crop_max_pct=95, rel_crop_invert=False, max_teaser_corr=800):
     """
     Process all files for a given depth method.
     
@@ -1102,7 +1163,8 @@ def process_depth_method(depth_method, depth_dir, limit=None, test_mode=False, e
             k_scale=k_scale,
             rel_crop_min_pct=rel_crop_min_pct,
             rel_crop_max_pct=rel_crop_max_pct,
-            rel_crop_invert=rel_crop_invert
+            rel_crop_invert=rel_crop_invert,
+            max_teaser_corr=max_teaser_corr
         )
         if result:
             processed += 1
@@ -1201,6 +1263,12 @@ if __name__ == "__main__":
         action="store_true",
         help="Invert percentile interpretation for relative depth methods (for 'larger value = closer' cases)"
     )
+    parser.add_argument(
+        "--max-teaser-corr",
+        type=int,
+        default=800,
+        help="Maximum number of correspondences to use for TEASER++ (default: 800). Larger values may cause max-clique blowups."
+    )
     args = parser.parse_args()
     
     # Determine which methods to process
@@ -1275,7 +1343,8 @@ if __name__ == "__main__":
             k_scale=args.k_scale,
             rel_crop_min_pct=args.rel_crop_min_pct,
             rel_crop_max_pct=args.rel_crop_max_pct,
-            rel_crop_invert=args.rel_crop_invert
+            rel_crop_invert=args.rel_crop_invert,
+            max_teaser_corr=args.max_teaser_corr
         )
         total_processed += processed
     
